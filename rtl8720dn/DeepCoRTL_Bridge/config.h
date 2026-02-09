@@ -14,6 +14,19 @@
 // =============================================
 #define CFG_AP_PASSWORD_DEFAULT   "12345678"
 
+// ---- 채널 자동 분산 (교실 다수 로봇 대응) ----
+// 1 = MAC 주소 기반 자동 채널 분산 (교실 권장)
+// 0 = CFG_AP_CHANNEL_DEFAULT 고정 채널 사용
+#define CFG_AP_CHANNEL_AUTO       1
+
+// 자동 분산 시 사용할 채널 풀 (5GHz 비중첩 8채널)
+// MAC 마지막 바이트 % 채널수 → 인덱스로 선택
+// 교실 30대 → 8채널에 ~4대씩 분산 → 간섭 1/8로 감소
+// 필요 시 2.4GHz 채널(1,6,11)로 변경 가능
+#define CFG_AP_CHANNEL_POOL       {36, 40, 44, 48, 149, 153, 157, 161}
+#define CFG_AP_CHANNEL_POOL_SIZE  8
+
+// 고정 채널 (CFG_AP_CHANNEL_AUTO=0일 때 사용)
 // 5GHz 채널: 36/40/44/48 또는 149/153/157/161
 // 2.4GHz 채널: 1~13
 #define CFG_AP_CHANNEL_DEFAULT    36

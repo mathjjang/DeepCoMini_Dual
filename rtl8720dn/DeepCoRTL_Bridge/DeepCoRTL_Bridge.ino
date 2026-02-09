@@ -117,6 +117,23 @@ static void buildSsidFromMac(char* out, size_t outLen) {
   snprintf(out, outLen, "DCM-%02X%02X%02X%02X", mac[2], mac[3], mac[4], mac[5]);
 }
 
+// MAC 기반 자동 채널 분산 (교실 다수 로봇 대응)
+// MAC 마지막 바이트 % 채널풀 크기 → 인덱스로 채널 선택
+// 30대 로봇 → 8채널에 ~4대씩 분산 → 같은 채널 간섭 1/8로 감소
+static int pickChannelFromMac() {
+#if CFG_AP_CHANNEL_AUTO
+  static const int channelPool[] = CFG_AP_CHANNEL_POOL;
+  uint8_t mac[6] = {0};
+  WiFi.macAddress(mac);
+  int idx = mac[5] % CFG_AP_CHANNEL_POOL_SIZE;
+  int ch = channelPool[idx];
+  Serial.printf("[RTL] Auto-channel: MAC[5]=0x%02X → pool[%d] = ch %d\n", mac[5], idx, ch);
+  return ch;
+#else
+  return CFG_AP_CHANNEL_DEFAULT;
+#endif
+}
+
 static void sendSafetyStopToS3() {
   // DeepcoMini v1.3 커맨드 규약 그대로
   Serial1.println("stop,100");
@@ -419,8 +436,13 @@ void setup() {
 
   char ssid[4 + 8 + 1] = {0};
   buildSsidFromMac(ssid, sizeof(ssid));
-  Serial.print("[RTL] AP SSID = ");
-  Serial.println(ssid);
+
+  // 자동 채널 분산: @set,channel 로 수동 설정하지 않은 경우 MAC 기반 자동 선택
+  if (g_apChannel == CFG_AP_CHANNEL_DEFAULT) {
+    g_apChannel = pickChannelFromMac();
+  }
+
+  Serial.printf("[RTL] AP SSID=%s, Channel=%d\n", ssid, g_apChannel);
 
   int status = WiFi.apbegin(ssid, g_apPassword, g_apChannel);
   if (status != WL_CONNECTED) {
@@ -598,8 +620,10 @@ static void handleSerialCommand(const String& cmd) {
     Serial1.printf("@debug,%c\n", v);
     Serial.printf("[RTL] Sent @debug,%c to S3\n", v);
   } else if (cmd == "@info") {
-    Serial.printf("[RTL] Channel=%d, Password='%s', IP=%s, SPI_HZ=%lu\n",
-                  g_apChannel, g_apPassword, WiFi.localIP().toString().c_str(), (unsigned long)SPI_HZ);
+    Serial.printf("[RTL] Channel=%d (%s), Password='%s', IP=%s, SPI_HZ=%lu\n",
+                  g_apChannel,
+                  CFG_AP_CHANNEL_AUTO ? "auto/MAC" : "fixed",
+                  g_apPassword, WiFi.localIP().toString().c_str(), (unsigned long)SPI_HZ);
     Serial.printf("[RTL] WS ctrl=%d, cam=%d, staCount=%d\n",
                   (int)hasControlClient,
 #if ENABLE_CAMERA_BRIDGE

@@ -7,9 +7,10 @@
   - RTL8720DN로부터 UART(Serial1)로 들어오는 제어 문자열을 처리
 
   주의:
-  - Serial1 RX/TX 핀은 PCB 설계에 맞게 반드시 수정하세요.
+  - 핀/파라미터 변경은 config.h에서 수정하세요.
 */
 
+#include "config.h"
 #include <Arduino.h>
 #include <sstream>
 #include <stdarg.h>
@@ -26,7 +27,7 @@
 // - 디버그 로그는 Serial1로 RTL에 전달해서 RTL USB 콘솔에서 확인
 // - 포맷: "@log,<text>\n"
 // -----------------------------
-static constexpr bool ENABLE_USB_SERIAL_DEBUG = false;
+static constexpr bool ENABLE_USB_SERIAL_DEBUG = CFG_ENABLE_USB_SERIAL_DEBUG;
 
 static void linkLogf(const char* fmt, ...) {
   char buf[256];
@@ -54,7 +55,7 @@ static void linkLogf(const char* fmt, ...) {
 // - PC는 RTL만 USB로 연결 → 로그는 Serial1(TX)로만 전달
 // - Serial1은 RX(제어) / TX(로그) 동시 사용(풀듀플렉스)
 // -----------------------------
-static constexpr bool ENABLE_TASK_SPLIT = true;
+static constexpr bool ENABLE_TASK_SPLIT = CFG_ENABLE_TASK_SPLIT;
 static TaskHandle_t g_taskSpiCamera = nullptr;
 static TaskHandle_t g_taskRobotCtrl = nullptr;
 static TaskHandle_t g_taskLed = nullptr;
@@ -107,27 +108,22 @@ static void ledUpdateOnce();
 #include <FastAccelStepper.h>
 
 // -----------------------------
-// UART link (RTL <-> S3)
+// UART link (RTL <-> S3) — 설정은 config.h
 // -----------------------------
-static constexpr uint32_t LINK_BAUD = 115200;
-// ESP32‑S3는 IO‑Matrix로 UART 핀을 자유롭게 지정 가능.
-// 아래 핀은 현재 프로젝트에서 "기본값"으로 고정(보드 설계에서 그대로 배선 권장).
-static constexpr int LINK_RX_PIN = 44;
-static constexpr int LINK_TX_PIN = 43;
+static constexpr uint32_t LINK_BAUD = CFG_LINK_BAUD;
+static constexpr int LINK_RX_PIN = CFG_LINK_RX_PIN;
+static constexpr int LINK_TX_PIN = CFG_LINK_TX_PIN;
 
 // -----------------------------
-// SPI link (Camera -> RTL)
-// ESP32-S3 = SPI Slave
+// SPI link (Camera -> RTL) — 설정은 config.h
 // -----------------------------
-// ESP32‑S3는 SPI Slave도 IO‑Matrix로 핀 지정 가능.
-// 카메라/모터/LED에서 사용 중인 GPIO를 피해서 기본값을 잡아둠.
-static constexpr int SPI_SCLK_PIN = 36;
-static constexpr int SPI_MOSI_PIN = 37; // Master->Slave (RTL MOSI)
-static constexpr int SPI_MISO_PIN = 35; // Slave->Master (S3 MISO)
-static constexpr int SPI_CS_PIN   = 34; // Slave Select
+static constexpr int SPI_SCLK_PIN = CFG_SPI_SCLK_PIN;
+static constexpr int SPI_MOSI_PIN = CFG_SPI_MOSI_PIN;
+static constexpr int SPI_MISO_PIN = CFG_SPI_MISO_PIN;
+static constexpr int SPI_CS_PIN   = CFG_SPI_CS_PIN;
 
-static constexpr size_t SPI_BLOCK_BYTES = 2048;
-static constexpr int SPI_QUEUE_SIZE = 2;
+static constexpr size_t SPI_BLOCK_BYTES = CFG_SPI_BLOCK_BYTES;
+static constexpr int SPI_QUEUE_SIZE = CFG_SPI_QUEUE_SIZE;
 
 #pragma pack(push, 1)
 struct DcmSpiHdr {
@@ -284,12 +280,12 @@ static void spiSlavePoll() {
 }
 
 // -----------------------------
-// LED pins (from v1.3)
+// LED pins — 설정은 config.h
 // -----------------------------
-static constexpr uint8_t LED_PIN_CENTER = 2;
-static constexpr uint8_t LED_PIN_RIGHT_NEOPIXEL = 47;
-static constexpr uint8_t LED_PIN_LEFT_NEOPIXEL  = 48;
-static constexpr uint16_t LED_PIXELS_PER_SIDE = 4;
+static constexpr uint8_t LED_PIN_CENTER = CFG_LED_CENTER_PIN;
+static constexpr uint8_t LED_PIN_RIGHT_NEOPIXEL = CFG_LED_RIGHT_NEOPIXEL_PIN;
+static constexpr uint8_t LED_PIN_LEFT_NEOPIXEL  = CFG_LED_LEFT_NEOPIXEL_PIN;
+static constexpr uint16_t LED_PIXELS_PER_SIDE = CFG_LED_PIXELS_PER_SIDE;
 
 Adafruit_NeoPixel ledRight(LED_PIXELS_PER_SIDE, LED_PIN_RIGHT_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel ledLeft(LED_PIXELS_PER_SIDE, LED_PIN_LEFT_NEOPIXEL, NEO_GRB + NEO_KHZ800);
@@ -419,26 +415,26 @@ static void ledUpdateOnce() {
 }
 
 // -----------------------------
-// Camera pins (from v1.3)
+// Camera pins — 설정은 config.h
 // -----------------------------
-#define PWDN_GPIO_NUM -1
-#define RESET_GPIO_NUM -1
-#define XCLK_GPIO_NUM 15
-#define SIOD_GPIO_NUM 4
-#define SIOC_GPIO_NUM 5
+#define PWDN_GPIO_NUM  CFG_CAM_PWDN_PIN
+#define RESET_GPIO_NUM CFG_CAM_RESET_PIN
+#define XCLK_GPIO_NUM  CFG_CAM_XCLK_PIN
+#define SIOD_GPIO_NUM  CFG_CAM_SIOD_PIN
+#define SIOC_GPIO_NUM  CFG_CAM_SIOC_PIN
 
-#define Y2_GPIO_NUM 11
-#define Y3_GPIO_NUM 9
-#define Y4_GPIO_NUM 8
-#define Y5_GPIO_NUM 10
-#define Y6_GPIO_NUM 12
-#define Y7_GPIO_NUM 18
-#define Y8_GPIO_NUM 17
-#define Y9_GPIO_NUM 16
+#define Y2_GPIO_NUM    CFG_CAM_Y2_PIN
+#define Y3_GPIO_NUM    CFG_CAM_Y3_PIN
+#define Y4_GPIO_NUM    CFG_CAM_Y4_PIN
+#define Y5_GPIO_NUM    CFG_CAM_Y5_PIN
+#define Y6_GPIO_NUM    CFG_CAM_Y6_PIN
+#define Y7_GPIO_NUM    CFG_CAM_Y7_PIN
+#define Y8_GPIO_NUM    CFG_CAM_Y8_PIN
+#define Y9_GPIO_NUM    CFG_CAM_Y9_PIN
 
-#define VSYNC_GPIO_NUM 6
-#define HREF_GPIO_NUM 7
-#define PCLK_GPIO_NUM 13
+#define VSYNC_GPIO_NUM CFG_CAM_VSYNC_PIN
+#define HREF_GPIO_NUM  CFG_CAM_HREF_PIN
+#define PCLK_GPIO_NUM  CFG_CAM_PCLK_PIN
 
 static void configCamera() {
   camera_config_t config;
@@ -460,13 +456,13 @@ static void configCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = CFG_CAM_XCLK_FREQ;
   config.frame_size = FRAMESIZE_QVGA;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 2;
+  config.jpeg_quality = CFG_CAM_JPEG_QUALITY;
+  config.fb_count = CFG_CAM_FB_COUNT;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -496,34 +492,34 @@ static void configCamera() {
 }
 
 // -----------------------------
-// Motors (from v1.3)
+// Motors — 설정은 config.h
 // -----------------------------
-static constexpr float WHEEL_DIAMETER_MM = 33.50f;
-static constexpr float TRACK_WIDTH_MM    = 73.5f;
-static constexpr float STEPS_PER_WHEEL_REV = 2000.0f;
+static constexpr float WHEEL_DIAMETER_MM = CFG_WHEEL_DIAMETER_MM;
+static constexpr float TRACK_WIDTH_MM    = CFG_TRACK_WIDTH_MM;
+static constexpr float STEPS_PER_WHEEL_REV = CFG_STEPS_PER_WHEEL_REV;
 
 static inline float computeStepPerAngle() {
   return (STEPS_PER_WHEEL_REV * TRACK_WIDTH_MM) / (360.0f * WHEEL_DIAMETER_MM);
 }
 
-const int m2stepPin = 40; // right STEP
-const int m2dirPin = 39;  // right DIR
-const int m2enPin = 38;   // right EN
+const int m2stepPin = CFG_MOTOR_R_STEP_PIN;
+const int m2dirPin  = CFG_MOTOR_R_DIR_PIN;
+const int m2enPin   = CFG_MOTOR_R_EN_PIN;
 
-const int stepPin = 21;  // left STEP
-const int dirPin = 42;   // left DIR
-const int enPin = 41;    // left EN
+const int stepPin = CFG_MOTOR_L_STEP_PIN;
+const int dirPin  = CFG_MOTOR_L_DIR_PIN;
+const int enPin   = CFG_MOTOR_L_EN_PIN;
 
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper* stepperLeft = nullptr;
 FastAccelStepper* stepperRight = nullptr;
 
-static constexpr float maxSpeedLimit = 2000.0f;
+static constexpr float maxSpeedLimit = CFG_MAX_SPEED_LIMIT;
 
 static void moveStep(int step) {
   if (!stepperLeft || !stepperRight) return;
-  stepperLeft->setSpeedInHz(1000);
-  stepperRight->setSpeedInHz(1000);
+  stepperLeft->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED);
+  stepperRight->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED);
   stepperLeft->move(step);
   stepperRight->move(-step);
 }
@@ -531,25 +527,25 @@ static void moveStep(int step) {
 static void moveAngle(int angle) {
   if (!stepperLeft || !stepperRight) return;
   const float stepPerAngle = computeStepPerAngle() * 2;
-  stepperLeft->setSpeedInHz(1000);
-  stepperRight->setSpeedInHz(1000);
+  stepperLeft->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED);
+  stepperRight->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED);
   stepperLeft->move(angle * stepPerAngle);
   stepperRight->move(angle * stepPerAngle);
 }
 
 static void moveForward() {
-  if (stepperLeft)  { stepperLeft->setSpeedInHz(1000); stepperLeft->runForward(); }
-  if (stepperRight) { stepperRight->setSpeedInHz(1000); stepperRight->runBackward(); }
+  if (stepperLeft)  { stepperLeft->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED); stepperLeft->runForward(); }
+  if (stepperRight) { stepperRight->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED); stepperRight->runBackward(); }
 }
 
 static void turnLeft() {
-  if (stepperLeft)  { stepperLeft->setSpeedInHz(700);  stepperLeft->runForward(); }
-  if (stepperRight) { stepperRight->setSpeedInHz(1000); stepperRight->runBackward(); }
+  if (stepperLeft)  { stepperLeft->setSpeedInHz(CFG_MOTOR_TURN_SLOW_SPEED); stepperLeft->runForward(); }
+  if (stepperRight) { stepperRight->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED); stepperRight->runBackward(); }
 }
 
 static void turnRight() {
-  if (stepperLeft)  { stepperLeft->setSpeedInHz(1000); stepperLeft->runForward(); }
-  if (stepperRight) { stepperRight->setSpeedInHz(700);  stepperRight->runBackward(); }
+  if (stepperLeft)  { stepperLeft->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED); stepperLeft->runForward(); }
+  if (stepperRight) { stepperRight->setSpeedInHz(CFG_MOTOR_TURN_SLOW_SPEED); stepperRight->runBackward(); }
 }
 
 static void stopRobot() {
@@ -674,9 +670,9 @@ void setup() {
   ledLeft.begin();
   ledRight.begin();
   ledCenter.begin();
-  ledLeft.setBrightness(128);
-  ledRight.setBrightness(128);
-  ledCenter.setBrightness(255);
+  ledLeft.setBrightness(CFG_LED_BRIGHTNESS_SIDE);
+  ledRight.setBrightness(CFG_LED_BRIGHTNESS_SIDE);
+  ledCenter.setBrightness(CFG_LED_BRIGHTNESS_CENTER);
   ledLeft.show();
   ledRight.show();
   ledCenter.show();
@@ -697,16 +693,16 @@ void setup() {
     stepperLeft->setDirectionPin(dirPin);
     stepperLeft->setEnablePin(enPin, true);
     stepperLeft->setAutoEnable(true);
-    stepperLeft->setAcceleration(10000);
-    stepperLeft->setSpeedInHz(1000);
+    stepperLeft->setAcceleration(CFG_MOTOR_ACCELERATION);
+    stepperLeft->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED);
   }
   stepperRight = engine.stepperConnectToPin(m2stepPin);
   if (stepperRight) {
     stepperRight->setDirectionPin(m2dirPin);
     stepperRight->setEnablePin(m2enPin, true);
     stepperRight->setAutoEnable(true);
-    stepperRight->setAcceleration(10000);
-    stepperRight->setSpeedInHz(1000);
+    stepperRight->setAcceleration(CFG_MOTOR_ACCELERATION);
+    stepperRight->setSpeedInHz(CFG_MOTOR_DEFAULT_SPEED);
   }
 
   // Camera (현재는 브릿지 송출은 RTL쪽에서 담당)

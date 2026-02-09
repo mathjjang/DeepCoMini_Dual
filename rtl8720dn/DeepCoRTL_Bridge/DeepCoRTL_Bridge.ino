@@ -13,8 +13,11 @@
 
   보드 패키지:
   - Realtek AmebaD (RTL8720DN) 보드 매니저 설치 필요
+
+  핀/파라미터 변경은 config.h에서 수정하세요.
 */
 
+#include "config.h"
 #include <WiFi.h>
 #include <SPI.h>
 
@@ -64,58 +67,41 @@ static bool g_tasksStartedRuntime = false;
 #endif
 
 // -----------------------------
-// User config
+// User config — 기본값은 config.h, 런타임 변경은 @set 명령
 // -----------------------------
-static const char* AP_PASSWORD = "12345678";
+// v0.1.1: 런타임 변경 가능 변수 (config.h의 기본값으로 초기화)
+static char g_apPassword[32] = CFG_AP_PASSWORD_DEFAULT;
+static int  g_apChannel = CFG_AP_CHANNEL_DEFAULT;
 
-// 5GHz를 쓰고 싶으면 보통 36/40/44/48 또는 149/153/157/161 등으로 시도
-// (보드/펌웨어/지역설정에 따라 지원 채널이 제한될 수 있음)
-static const int   AP_CHANNEL  = 36;
+// 로봇 고정 IP (DeepCoConnector 호환) — config.h
+static const IPAddress AP_IP(CFG_AP_IP_A, CFG_AP_IP_B, CFG_AP_IP_C, CFG_AP_IP_D);
+static const IPAddress AP_GW(CFG_AP_IP_A, CFG_AP_IP_B, CFG_AP_IP_C, CFG_AP_IP_D);
+static const IPAddress AP_SN(CFG_AP_SUBNET_A, CFG_AP_SUBNET_B, CFG_AP_SUBNET_C, CFG_AP_SUBNET_D);
+static const IPAddress AP_DNS(CFG_AP_DNS_A, CFG_AP_DNS_B, CFG_AP_DNS_C, CFG_AP_DNS_D);
 
-// 로봇 고정 IP (DeepCoConnector 호환)
-static const IPAddress AP_IP(192, 168, 4, 1);
-static const IPAddress AP_GW(192, 168, 4, 1);
-static const IPAddress AP_SN(255, 255, 255, 0);
-static const IPAddress AP_DNS(8, 8, 8, 8);
-
-// UART link to ESP32‑S3 (Robot control)
-// NOTE:
-// - AmebaD의 Serial1은 보통 "핀 재매핑"이 아니라 보드 variant에 고정된 핀을 사용합니다.
-// - BW16(variant: rtl8720dn_bw16) 기준 핀은 아래 상수에 "문서용"으로 명시합니다.
-static const uint32_t LINK_BAUD = 115200;
+// UART link to ESP32‑S3 — config.h
+static const uint32_t LINK_BAUD = CFG_LINK_BAUD;
 
 // -----------------------------
-// Pin map (BW16 기준, 코드에서 바로 보이게)
+// Pin map (BW16 기준) — 참고용, variant에 의해 고정
 // -----------------------------
-// USB 디버그 콘솔(보드 USB-C로 연결되는 경우가 많음)
-static constexpr int RTL_LOG_TX_PIN = D0; // PA7
-static constexpr int RTL_LOG_RX_PIN = D1; // PA8
-
-// UART 링크(Serial1): RTL <-> S3
-static constexpr int RTL_LINK_TX_PIN = D4; // PB1, RTL -> S3 (S3 RX로 연결)
-static constexpr int RTL_LINK_RX_PIN = D5; // PB2, S3 -> RTL (S3 TX에서 들어옴)
-
-// SPI Master(카메라 링크): RTL(마스터) <-> S3(슬레이브)
+static constexpr int RTL_LOG_TX_PIN = D0;  // PA7 (USB 디버그)
+static constexpr int RTL_LOG_RX_PIN = D1;  // PA8
+static constexpr int RTL_LINK_TX_PIN = D4; // PB1, RTL→S3
+static constexpr int RTL_LINK_RX_PIN = D5; // PB2, S3→RTL
 static constexpr int RTL_SPI_SS_PIN_DOC   = D9;  // PA15
 static constexpr int RTL_SPI_SCLK_PIN_DOC = D10; // PA14
 static constexpr int RTL_SPI_MISO_PIN_DOC = D11; // PA13
 static constexpr int RTL_SPI_MOSI_PIN_DOC = D12; // PA12
 
 // -----------------------------
-// SPI link (Camera stream)
-// RTL8720DN = SPI Master, ESP32‑S3 = SPI Slave
+// SPI link — 설정은 config.h
 // -----------------------------
-// NOTE(AmebaD SPI):
-// - SPI SS는 보드(variant)의 SPI_SS를 쓰는 게 가장 안전합니다.
-// - 아래 SPI_SS_PIN은 "CS로 토글할 Arduino pin number" 입니다.
-//   (BW16 기준: SPI_SS == D9 == PA15)
-// 혼동 방지를 위해, BW16에서는 명시적으로 D9를 사용합니다.
-static constexpr int SPI_SS_PIN = RTL_SPI_SS_PIN_DOC; // D9 (PA15)
-static constexpr uint32_t SPI_HZ = 30000000; // QVGA 30fps 목표: 30MHz부터 시도(배선/보드에 따라 조정)
-static constexpr size_t SPI_BLOCK_BYTES = 2048; // DMA/메모리 안전을 위해 2KB 블록
+static constexpr int SPI_SS_PIN = CFG_SPI_SS_PIN;
+static constexpr uint32_t SPI_HZ = CFG_SPI_HZ;
+static constexpr size_t SPI_BLOCK_BYTES = CFG_SPI_BLOCK_BYTES;
 
-// Camera bridge: ON (완성본)
-#define ENABLE_CAMERA_BRIDGE 1
+#define ENABLE_CAMERA_BRIDGE CFG_ENABLE_CAMERA_BRIDGE
 
 // 설계 방침(사용자 요청):
 // - RTL은 SPI로 "항상" 카메라 프레임을 당겨서 최신 프레임을 유지한다.
@@ -221,7 +207,7 @@ static constexpr uint8_t SPI_FLAG_END   = 0x02;
 static uint8_t g_spiRx[SPI_BLOCK_BYTES];
 
 // 최신 프레임 캐시(WS 송출용). SPI task가 업데이트하고, WS task가 읽음.
-static uint8_t g_frameBuf[64 * 1024]; // 64KB cap (QVGA JPEG 권장)
+static uint8_t g_frameBuf[CFG_FRAME_BUF_SIZE];
 static volatile size_t  g_frameLen = 0;
 static volatile uint16_t g_frameSeq = 0;
 
@@ -409,7 +395,7 @@ void setup() {
   Serial.print("[RTL] AP SSID = ");
   Serial.println(ssid);
 
-  int status = WiFi.apbegin(ssid, AP_PASSWORD, AP_CHANNEL);
+  int status = WiFi.apbegin(ssid, g_apPassword, g_apChannel);
   if (status != WL_CONNECTED) {
     // AmebaD는 apbegin() 리턴이 status 형태(문서상 "status of AP")
     Serial.print("[RTL] apbegin() status = ");
@@ -421,13 +407,13 @@ void setup() {
   // Initial LED link state for S3
   sendLedLinkStateToS3(true);
 
-  // WebSocket servers
-  wsControl.listen(80);
-  Serial.println("[RTL] WS control listening on :80 (/ws accepted)");
+  // WebSocket servers — config.h
+  wsControl.listen(CFG_WS_CONTROL_PORT);
+  Serial.printf("[RTL] WS control listening on :%d (/ws accepted)\n", CFG_WS_CONTROL_PORT);
 
 #if ENABLE_CAMERA_BRIDGE
-  wsCamera.listen(81);
-  Serial.println("[RTL] WS camera listening on :81 (/ accepted)");
+  wsCamera.listen(CFG_WS_CAMERA_PORT);
+  Serial.printf("[RTL] WS camera listening on :%d (/ accepted)\n", CFG_WS_CAMERA_PORT);
 #else
   Serial.println("[RTL] Camera bridge disabled (ENABLE_CAMERA_BRIDGE=0)");
 #endif
@@ -509,6 +495,73 @@ static void pollCameraClient() {
 }
 #endif
 
+// -----------------------------
+// v0.1.1: USB Serial 설정 명령 처리
+// @set,channel,149   → Wi-Fi 채널 변경 (재부팅 후 적용)
+// @set,password,xxxx → 비밀번호 변경 (재부팅 후 적용)
+// @reboot            → RTL 재부팅
+// @info              → 현재 설정 출력
+// -----------------------------
+static bool g_needReboot = false;
+
+static void handleSerialCommand(const String& cmd) {
+  if (cmd.startsWith("@set,channel,")) {
+    int ch = atoi(cmd.c_str() + 13);
+    if (ch > 0 && ch < 200) {
+      g_apChannel = ch;
+      g_needReboot = true;
+      Serial.printf("[RTL] Channel set to %d (reboot to apply: @reboot)\n", g_apChannel);
+    } else {
+      Serial.println("[RTL] Invalid channel");
+    }
+  } else if (cmd.startsWith("@set,password,")) {
+    String pw = cmd.substring(14);
+    if (pw.length() >= 8 && pw.length() < sizeof(g_apPassword)) {
+      strncpy(g_apPassword, pw.c_str(), sizeof(g_apPassword) - 1);
+      g_apPassword[sizeof(g_apPassword) - 1] = '\0';
+      g_needReboot = true;
+      Serial.printf("[RTL] Password set to '%s' (reboot to apply: @reboot)\n", g_apPassword);
+    } else {
+      Serial.println("[RTL] Password must be 8~31 chars");
+    }
+  } else if (cmd == "@reboot") {
+    Serial.println("[RTL] Rebooting...");
+    delay(200);
+    // AmebaD software reset
+    NVIC_SystemReset();
+  } else if (cmd == "@info") {
+    Serial.printf("[RTL] Channel=%d, Password='%s', IP=%s, SPI_HZ=%lu\n",
+                  g_apChannel, g_apPassword, WiFi.localIP().toString().c_str(), (unsigned long)SPI_HZ);
+    Serial.printf("[RTL] WS ctrl=%d, cam=%d, staCount=%d\n",
+                  (int)hasControlClient,
+#if ENABLE_CAMERA_BRIDGE
+                  (int)hasCameraClient,
+#else
+                  0,
+#endif
+                  (int)g_ledStaCount);
+  } else {
+    Serial.printf("[RTL] Unknown command: %s\n", cmd.c_str());
+    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @reboot / @info");
+  }
+}
+
+static void pollUsbSerialCommands() {
+  static String usbLine;
+  while (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      if (usbLine.length() > 0 && usbLine.charAt(0) == '@') {
+        handleSerialCommand(usbLine);
+      }
+      usbLine = "";
+      continue;
+    }
+    if (usbLine.length() < 128) usbLine += ch;
+  }
+}
+
 // S3 -> RTL 텍스트(선택): 디버그/상태를 WS로 되돌리고 싶으면 사용
 static void pumpS3TextToWs() {
   // 현재는 "줄 단위" 텍스트만 처리
@@ -565,7 +618,7 @@ void loop() {
   // 카메라: SPI로 프레임을 "항상" 받아서 최신 프레임 유지
   static uint32_t lastPullMs = 0;
   const uint32_t nowMs = millis();
-  const uint32_t pullIntervalMs = g_wantStream ? 0 : 200; // no-client: 5fps 정도로만 유지
+  const uint32_t pullIntervalMs = g_wantStream ? 0 : CFG_SPI_IDLE_PULL_MS;
 
   if (g_wantStream || (nowMs - lastPullMs >= pullIntervalMs)) {
     lastPullMs = nowMs;
@@ -579,11 +632,11 @@ void loop() {
     }
   }
 
-  // 성능 로그(2초마다): QVGA 30fps 튜닝용
+  // 성능 로그: QVGA 30fps 튜닝용
   static uint32_t lastStatMs = 0;
-  if (nowMs - lastStatMs >= 2000) {
+  if (nowMs - lastStatMs >= CFG_STAT_INTERVAL_MS) {
     lastStatMs = nowMs;
-    const float secs = 2.0f;
+    const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
     const float fps = (float)g_statFrames / secs;
     const float kbps = ((float)g_statBytes / 1024.0f) / secs;
     Serial.printf("[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f (SPI_HZ=%lu)\n",
@@ -596,6 +649,9 @@ void loop() {
 
   // S3 로그/상태 수신
   pumpS3TextToWs();
+
+  // v0.1.1: USB Serial 설정 명령 처리
+  pollUsbSerialCommands();
 }
 
 #if RTL_HAS_FREERTOS
@@ -633,11 +689,11 @@ static void taskWsUart(void* arg) {
       if (g_frameMutex) xSemaphoreGive(g_frameMutex);
     }
 
-    // 성능 로그(2초마다): SPI task가 stat을 올리고, 출력만 여기서
+    // 성능 로그: SPI task가 stat을 올리고, 출력만 여기서
     const uint32_t nowMs = millis();
-    if (nowMs - lastStatMs >= 2000) {
+    if (nowMs - lastStatMs >= CFG_STAT_INTERVAL_MS) {
       lastStatMs = nowMs;
-      const float secs = 2.0f;
+      const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
       const float fps = (float)g_statFrames / secs;
       const float kbps = ((float)g_statBytes / 1024.0f) / secs;
       Serial.printf("[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f (SPI_HZ=%lu)\n",
@@ -649,6 +705,7 @@ static void taskWsUart(void* arg) {
 #endif
 
     pumpS3TextToWs();
+    pollUsbSerialCommands();
 
     // 태스크 동작 확인용 하트비트(5초마다)
     const uint32_t nowBeat = millis();
@@ -670,7 +727,7 @@ static void taskSpiPull(void* arg) {
   for (;;) {
 #if ENABLE_CAMERA_BRIDGE
     const uint32_t nowMs = millis();
-    const uint32_t pullIntervalMs = g_wantStream ? 0 : 200; // no-client: 5fps 정도
+    const uint32_t pullIntervalMs = g_wantStream ? 0 : CFG_SPI_IDLE_PULL_MS;
 
     if (g_wantStream || (nowMs - lastPullMs >= pullIntervalMs)) {
       lastPullMs = nowMs;

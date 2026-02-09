@@ -556,6 +556,47 @@ static void handleSerialCommand(const String& cmd) {
     delay(200);
     // AmebaD software reset
     NVIC_SystemReset();
+  } else if (cmd == "@diag") {
+    // v0.1.3: 종합 진단 정보 출력 + WS 전달
+    const uint32_t uptimeSec = millis() / 1000;
+    const uint32_t uptimeMin = uptimeSec / 60;
+    char diagBuf[512];
+    snprintf(diagBuf, sizeof(diagBuf),
+      "@diag,{"
+      "\"uptime_sec\":%lu,"
+      "\"ap_channel\":%d,"
+      "\"sta_count\":%d,"
+      "\"ws_ctrl\":%d,"
+#if ENABLE_CAMERA_BRIDGE
+      "\"ws_cam\":%d,"
+      "\"frame_seq\":%u,"
+      "\"frame_len\":%u,"
+#endif
+      "\"spi_hz\":%lu,"
+      "\"buf_size\":%u"
+      "}",
+      (unsigned long)uptimeSec,
+      g_apChannel,
+      (int)g_ledStaCount,
+      (int)hasControlClient,
+#if ENABLE_CAMERA_BRIDGE
+      (int)hasCameraClient,
+      (unsigned)g_frameSeq,
+      (unsigned)g_frameLen,
+#endif
+      (unsigned long)SPI_HZ,
+      (unsigned)sizeof(g_frameBuf)
+    );
+    Serial.println(diagBuf);
+    if (hasControlClient && controlClient.available()) {
+      controlClient.send(diagBuf);
+    }
+    Serial.printf("[RTL] Uptime: %lum %lus\n", (unsigned long)uptimeMin, (unsigned long)(uptimeSec % 60));
+  } else if (cmd.startsWith("@s3debug,")) {
+    // v0.1.3: S3 USB 디버그 토글 명령 전달
+    const char v = (cmd.length() >= 10) ? cmd.charAt(9) : '0';
+    Serial1.printf("@debug,%c\n", v);
+    Serial.printf("[RTL] Sent @debug,%c to S3\n", v);
   } else if (cmd == "@info") {
     Serial.printf("[RTL] Channel=%d, Password='%s', IP=%s, SPI_HZ=%lu\n",
                   g_apChannel, g_apPassword, WiFi.localIP().toString().c_str(), (unsigned long)SPI_HZ);
@@ -569,7 +610,7 @@ static void handleSerialCommand(const String& cmd) {
                   (int)g_ledStaCount);
   } else {
     Serial.printf("[RTL] Unknown command: %s\n", cmd.c_str());
-    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @reboot / @info");
+    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @s3debug,0|1 / @diag / @reboot / @info");
   }
 }
 

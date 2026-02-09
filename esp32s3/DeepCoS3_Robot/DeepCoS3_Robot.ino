@@ -27,7 +27,8 @@
 // - 디버그 로그는 Serial1로 RTL에 전달해서 RTL USB 콘솔에서 확인
 // - 포맷: "@log,<text>\n"
 // -----------------------------
-static constexpr bool ENABLE_USB_SERIAL_DEBUG = CFG_ENABLE_USB_SERIAL_DEBUG;
+// v0.1.3: 런타임 디버그 토글 — @debug,0/@debug,1 명령 또는 RTL에서 @s3debug,0/1
+static bool g_usbDebugEnabled = CFG_ENABLE_USB_SERIAL_DEBUG;
 
 static void linkLogf(const char* fmt, ...) {
   char buf[256];
@@ -37,7 +38,7 @@ static void linkLogf(const char* fmt, ...) {
   va_end(ap);
 #if 1
   // PC가 S3를 직접 USB로 연결해 디버깅할 때만 사용
-  if (ENABLE_USB_SERIAL_DEBUG) {
+  if (g_usbDebugEnabled) {
     Serial.print("[S3] ");
     Serial.println(buf);
   }
@@ -78,6 +79,9 @@ enum class LedStatus : uint8_t { BOOTING = 0, READY = 1, WIFI_CONNECTED = 2, CON
 static volatile bool g_wsConnected = false;   // (/ws)
 static volatile uint16_t g_apStaCount = 0;    // station count (RTL AP)
 static LedStatus g_ledStatus = LedStatus::BOOTING;
+// v0.1.3: 연결 시간 추적
+static uint32_t g_wsConnectedSinceMs = 0;
+static uint32_t g_staConnectedSinceMs = 0;
 
 struct LedFlash {
   uint32_t color = 0;
@@ -591,6 +595,8 @@ static void handleCommandLine(const String& line) {
     const bool newWs = (v == '1');
     const bool prevWs = g_wsConnected;
     g_wsConnected = newWs;
+    // v0.1.3: 연결 시점 기록
+    if (newWs && !prevWs) g_wsConnectedSinceMs = millis();
     updateLedStatusFromLinks();
     // v1.3: WS disconnect -> red 1x long blink on both sides
     if (prevWs && !newWs) {
@@ -601,12 +607,26 @@ static void handleCommandLine(const String& line) {
   if (line.startsWith("@sta,")) {
     const int n = atoi(line.c_str() + 5);
     if (n < 0) return;
+    const uint16_t prev = g_apStaCount;
     g_apStaCount = (uint16_t)n;
+    // v0.1.3: 연결 시점 기록
+    if (n > 0 && prev == 0) g_staConnectedSinceMs = millis();
     // v1.3 logic: staCount==0이면 WS 연결도 존재할 수 없으므로 즉시 false로 강등
     if (g_apStaCount == 0) {
       g_wsConnected = false;
     }
     updateLedStatusFromLinks();
+    return;
+  }
+
+  // v0.1.3: @debug,0/@debug,1 — USB Serial 디버그 토글
+  if (line.startsWith("@debug,")) {
+    const char v = (line.length() >= 8) ? line.charAt(7) : '0';
+    g_usbDebugEnabled = (v == '1');
+    linkLogf("USB debug %s", g_usbDebugEnabled ? "ON" : "OFF");
+    if (g_usbDebugEnabled) {
+      Serial.printf("[S3] USB debug enabled via command\n");
+    }
     return;
   }
 
@@ -661,10 +681,9 @@ static bool readLineFromSerial1(String& outLine) {
 void setup() {
   // UART link
   Serial1.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
-  if (ENABLE_USB_SERIAL_DEBUG) {
-    Serial.begin(115200);
-    delay(200);
-  }
+  // v0.1.3: USB Serial은 항상 초기화 (런타임 디버그 토글 지원)
+  Serial.begin(115200);
+  delay(200);
   linkLogf("DeepCoS3_Robot boot");
   linkLogf("Serial1 baud=%u RX=%d TX=%d", (unsigned)LINK_BAUD, LINK_RX_PIN, LINK_TX_PIN);
   linkLogf("SPI slave pins: CS=%d SCLK=%d MISO=%d MOSI=%d (block=%u bytes)",
@@ -730,6 +749,12 @@ void setup() {
   } else {
     linkLogf("Tasks disabled: using loop() polling");
   }
+
+  // v0.1.3: 부팅 진단 요약
+  linkLogf("Boot diag: cam=%s spi=%s debug=%s",
+           g_cameraInitOk ? "OK" : "FAIL",
+           g_spiInitOk ? "OK" : "FAIL",
+           g_usbDebugEnabled ? "ON" : "OFF");
 }
 
 void loop() {

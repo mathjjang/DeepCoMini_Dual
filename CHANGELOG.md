@@ -5,15 +5,7 @@
 
 ---
 
-## [Unreleased] — v0.1.3 이후 작업 (태그 미지정)
-
-### 문서
-- **듀얼칩설계전략및펌웨어업그레이드방법.md** 신규 작성
-  - USB-C 연결 전략 4가지 비교 (USB→RTL / USB→S3 / USB→Hub / USB→S3 Hybrid)
-  - 펌웨어 업그레이드 누적 단계 구조 정리 (단계1: USB패스스루 → 단계2: Wi-Fi OTA → 단계3: SPI 고속 OTA)
-  - 추천 설계: Option D (USB-C → S3 Hybrid, S3가 GPIO로 RTL 부트/리셋 제어)
-  - OTA 파티션 비교: RTL(SDK 기본 내장) vs S3(partitions.csv 수정 필요)
-  - RTL/S3 플래시 레이아웃 다이어그램 추가
+## [v0.1.4] — 2026-02-09 — 교실 다수 로봇 채널 분산 + 설계 문서
 
 ### 기능
 - **MAC 기반 Wi-Fi 채널 자동 분산** (`config.h`, `DeepCoRTL_Bridge.ino`)
@@ -22,6 +14,14 @@
   - `CFG_AP_CHANNEL_AUTO = 1` (기본 활성화)
   - `@set,channel,N`으로 수동 지정 시 자동 분산 무시
   - `@info` 명령에 `auto/MAC` / `fixed` 표시 추가
+
+### 문서
+- **듀얼칩설계전략및펌웨어업그레이드방법.md** 신규 작성
+  - USB-C 연결 전략 4가지 비교 (USB→RTL / USB→S3 / USB→Hub / USB→S3 Hybrid)
+  - 펌웨어 업그레이드 누적 단계 구조 정리 (단계1: USB패스스루 → 단계2: Wi-Fi OTA → 단계3: SPI 고속 OTA)
+  - 추천 설계: Option D (USB-C → S3 Hybrid, S3가 GPIO로 RTL 부트/리셋 제어)
+  - OTA 파티션 비교: RTL(SDK 기본 내장) vs S3(partitions.csv 수정 필요)
+  - RTL/S3 플래시 레이아웃 다이어그램 추가
 
 ### 변경 파일
 - `rtl8720dn/DeepCoRTL_Bridge/config.h` — 자동 채널 분산 설정 추가 (+13줄)

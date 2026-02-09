@@ -219,6 +219,10 @@ static volatile bool g_wantStream = false;
 static uint32_t g_statBlocks = 0;
 static uint32_t g_statFrames = 0;
 static uint32_t g_statBytes = 0;
+// v0.1.2: 에러 통계
+static uint32_t g_statSyncErrors = 0;   // 매직 불일치
+static uint32_t g_statSeqErrors = 0;    // 시퀀스/오프셋 불일치로 드랍
+static uint32_t g_statOversize = 0;     // 프레임 크기 초과로 드랍
 
 static inline bool hdrLooksOk(const DcmSpiHdr& h) {
   return (h.magic[0] == 'D' && h.magic[1] == 'C' && h.magic[2] == 'M' && h.magic[3] == '2');
@@ -239,6 +243,10 @@ static bool spiReadBlock(uint8_t* dst, size_t len) {
   return true;
 }
 
+// v0.1.2: 재동기화 상수
+static constexpr uint8_t SPI_MAX_SYNC_RETRIES = 5;   // 연속 매직 불일치 시 리셋까지 허용 횟수
+static constexpr uint8_t SPI_MAX_SEQ_RETRIES  = 3;   // 시퀀스 깨짐 시 프레임 드랍 & 재시작 횟수
+
 static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
   const uint32_t start = millis();
 
@@ -246,6 +254,8 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
   uint16_t curSeq = 0;
   size_t expectedTotal = 0;
   size_t received = 0;
+  uint8_t syncRetries = 0;
+  uint8_t seqRetries = 0;
 
   while (millis() - start < timeoutMs) {
     if (!spiReadBlock(g_spiRx, SPI_BLOCK_BYTES)) {
@@ -256,12 +266,25 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
 
     if (SPI_BLOCK_BYTES < sizeof(DcmSpiHdr)) continue;
     const DcmSpiHdr* hdr = (const DcmSpiHdr*)g_spiRx;
+
     if (!hdrLooksOk(*hdr)) {
-      // 동기 깨짐 -> 다음 블록
+      g_statSyncErrors++;
+      syncRetries++;
+      if (syncRetries >= SPI_MAX_SYNC_RETRIES) {
+        // v0.1.2: 연속 동기 실패 시 CS 토글로 SPI 라인 리셋 시도
+        digitalWrite(SPI_SS_PIN, HIGH);
+        delay(5);
+        digitalWrite(SPI_SS_PIN, LOW);
+        delay(1);
+        syncRetries = 0;
+        haveHeader = false;
+      }
+      delay(1);
       continue;
     }
+    syncRetries = 0; // 매직 OK → 리셋
+
     if (hdr->type == SPI_TYPE_IDLE) {
-      // 아직 프레임 없음
       delay(2);
       continue;
     }
@@ -278,22 +301,27 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
       received = 0;
 
       if (expectedTotal == 0 || expectedTotal > sizeof(g_frameBuf)) {
-        // 너무 큼 -> 드랍
+        g_statOversize++;
         haveHeader = false;
-        expectedTotal = 0;
-        received = 0;
         continue;
       }
       haveHeader = true;
+      seqRetries = 0;
     }
 
     // 같은 프레임인지 확인
     if (!haveHeader || hdr->seq != curSeq) {
+      g_statSeqErrors++;
+      seqRetries++;
       haveHeader = false;
+      if (seqRetries >= SPI_MAX_SEQ_RETRIES) {
+        // v0.1.2: 연속 시퀀스 오류 → 타임아웃 대기 대신 즉시 새 프레임 탐색
+        seqRetries = 0;
+      }
       continue;
     }
     if (hdr->offset != received) {
-      // 순서 깨짐 -> 드랍
+      g_statSeqErrors++;
       haveHeader = false;
       continue;
     }
@@ -309,7 +337,6 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
 
     const bool isEnd = (hdr->flags & SPI_FLAG_END) != 0;
     if (isEnd && received == expectedTotal) {
-      // 최신 프레임 캐시 업데이트
 #if RTL_HAS_FREERTOS
       if (RTL_USE_TASKS && g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
 #endif
@@ -575,6 +602,14 @@ static void pumpS3TextToWs() {
         if (line.startsWith("@log,")) {
           Serial.print("[S3] ");
           Serial.println(line.substring(5));
+        }
+        // v0.1.2: 에러 전파 — S3가 "@err,"로 보내면 USB콘솔 + WS로 중계
+        else if (line.startsWith("@err,")) {
+          Serial.print("[S3][ERR] ");
+          Serial.println(line.substring(5));
+          if (hasControlClient && controlClient.available()) {
+            controlClient.send(line.c_str());  // PC에 "@err,코드,메시지" 그대로 전달
+          }
         } else {
           // 그 외 텍스트는 (선택) WS control로 echo
           if (hasControlClient && controlClient.available()) {
@@ -639,11 +674,15 @@ void loop() {
     const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
     const float fps = (float)g_statFrames / secs;
     const float kbps = ((float)g_statBytes / 1024.0f) / secs;
-    Serial.printf("[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f (SPI_HZ=%lu)\n",
-                  fps, (unsigned long)g_statBlocks, kbps, (unsigned long)SPI_HZ);
+    Serial.printf("[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu\n",
+                  fps, (unsigned long)g_statBlocks, kbps,
+                  (unsigned long)g_statSyncErrors, (unsigned long)g_statSeqErrors, (unsigned long)g_statOversize);
     g_statBlocks = 0;
     g_statFrames = 0;
     g_statBytes = 0;
+    g_statSyncErrors = 0;
+    g_statSeqErrors = 0;
+    g_statOversize = 0;
   }
 #endif
 
@@ -696,11 +735,15 @@ static void taskWsUart(void* arg) {
       const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
       const float fps = (float)g_statFrames / secs;
       const float kbps = ((float)g_statBytes / 1024.0f) / secs;
-      Serial.printf("[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f (SPI_HZ=%lu)\n",
-                    fps, (unsigned long)g_statBlocks, kbps, (unsigned long)SPI_HZ);
+      Serial.printf("[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu\n",
+                    fps, (unsigned long)g_statBlocks, kbps,
+                    (unsigned long)g_statSyncErrors, (unsigned long)g_statSeqErrors, (unsigned long)g_statOversize);
       g_statBlocks = 0;
       g_statFrames = 0;
       g_statBytes = 0;
+      g_statSyncErrors = 0;
+      g_statSeqErrors = 0;
+      g_statOversize = 0;
     }
 #endif
 

@@ -55,8 +55,9 @@
 // =============================================
 #define CFG_ENABLE_CAMERA_BRIDGE  1
 
-// 프레임 버퍼 최대 크기 (QVGA JPEG 기준)
-#define CFG_FRAME_BUF_SIZE    (64 * 1024)  // 64KB
+// 프레임 버퍼 최대 크기
+// v0.1.2: 64KB→128KB로 확대 (VGA JPEG도 수용 가능)
+#define CFG_FRAME_BUF_SIZE    (128 * 1024)  // 128KB
 
 // =============================================
 // WebSocket 서버 포트

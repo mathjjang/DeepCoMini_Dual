@@ -233,6 +233,8 @@ static bool spiSlaveInit() {
   esp_err_t err = spi_slave_initialize(SPI2_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
   if (err != ESP_OK) {
     linkLogf("spi_slave_initialize failed: 0x%x", err);
+    // v0.1.2: 에러 전파
+    Serial1.printf("@err,SPI_INIT,SPI slave init failed: 0x%x\n", err);
     return false;
   }
 
@@ -468,6 +470,8 @@ static void configCamera() {
   if (err != ESP_OK) {
     linkLogf("Camera init failed: 0x%x", err);
     g_cameraInitOk = false;
+    // v0.1.2: 에러 전파 — RTL이 WS로 중계
+    Serial1.printf("@err,CAM_INIT,Camera init failed: 0x%x\n", err);
     return;
   }
   g_cameraInitOk = true;

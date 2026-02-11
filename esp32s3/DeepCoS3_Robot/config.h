@@ -72,7 +72,7 @@
 // 모터 핀 (스텝퍼)
 // =============================================
 // 왼쪽 모터
-#define CFG_MOTOR_L_STEP_PIN  21
+#define CFG_MOTOR_L_STEP_PIN  21   //1 <-> 21
 #define CFG_MOTOR_L_DIR_PIN   42
 #define CFG_MOTOR_L_EN_PIN    41
 

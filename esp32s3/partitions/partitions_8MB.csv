@@ -15,7 +15,8 @@
 #
 # Usage:
 #   1. Arduino IDE -> Tools -> Flash Size -> "8MB"
-#   2. This file in sketch folder overrides the selected partition scheme automatically
+#   2. Copy this file to sketch folder as "partitions.csv"
+#      (overrides the selected partition scheme automatically)
 #
 # OTA Operation:
 #   1st: ota_0 runs -> writes new firmware to ota_1 -> reboot -> ota_1 runs

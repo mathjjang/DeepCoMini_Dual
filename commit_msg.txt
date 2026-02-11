@@ -1,0 +1,10 @@
+v0.1.10: 3-level logging system (LOG_NONE/INFO/DEBUG)
+
+- S3: logInfo()/logDebug() functions replace linkLogf()
+- RTL: RTL_INFO()/RTL_DEBUG() macros with g_logLevel filter
+- Runtime control: @debug,0/1/2 (RTL), @s3debug,0/1/2 (S3 via RTL)
+- Boot messages show version + log level
+- INFO: boot, connection, OTA, errors
+- DEBUG: SPI stats, heartbeat, motor, watchdog
+- S3 partitions.csv updated to 8MB layout
+- 4MB/8MB/16MB partition templates added

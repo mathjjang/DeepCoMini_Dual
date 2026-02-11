@@ -9,14 +9,23 @@
 // =============================================
 // 펌웨어 버전 (GitHub 태그와 반드시 일치시킬 것)
 // =============================================
-#define CFG_FW_VERSION    "0.1.9"
+#define CFG_FW_VERSION    "0.1.10"
 #define CFG_FW_CHIP       "S3"
 
 // =============================================
-// 디버그 설정
+// 로그 레벨 설정
 // =============================================
-// true로 바꾸면 S3 USB Serial에도 로그 출력 (기본: RTL 경유만)
-#define CFG_ENABLE_USB_SERIAL_DEBUG   false
+// LOG_NONE  (0) = 출력 완전 차단 (배포/생산)
+// LOG_INFO  (1) = 핵심 이벤트만 (부팅, 연결, OTA, 에러)
+// LOG_DEBUG (2) = 전부 출력 (SPI, 모터, 프레임, 워치독 등)
+//
+// 런타임 변경: RTL에서 @s3debug,0/1/2 또는 S3 UART에서 @debug,0/1/2
+#define LOG_NONE   0
+#define LOG_INFO   1
+#define LOG_DEBUG  2
+
+#define CFG_LOG_LEVEL   LOG_INFO    // 기본 로그 레벨
+#define CFG_LOG_USB     true        // USB Serial(CDC) 출력 활성화 (devkit 단독 테스트 시 true)
 
 // FreeRTOS 태스크 분리 모드 (false면 loop() 폴링)
 #define CFG_ENABLE_TASK_SPLIT         true
@@ -78,7 +87,7 @@
 // 모터 핀 (스텝퍼)
 // =============================================
 // 왼쪽 모터
-#define CFG_MOTOR_L_STEP_PIN  21   //1 <-> 21
+#define CFG_MOTOR_L_STEP_PIN  1   //1 <-> 21
 #define CFG_MOTOR_L_DIR_PIN   42
 #define CFG_MOTOR_L_EN_PIN    41
 

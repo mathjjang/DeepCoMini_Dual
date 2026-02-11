@@ -5,6 +5,57 @@
 
 ---
 
+## [v0.1.10] — 2026-02-12 — 3단계 로그 레벨 시스템 (LOG_NONE / LOG_INFO / LOG_DEBUG)
+
+### 배경
+- 기존 로그는 ON/OFF 토글만 가능 → 개발/시연/배포 상황에 맞는 세분화된 출력 제어 필요
+- 듀얼 칩(S3 + RTL) 양쪽에 통일된 로그 레벨 아키텍처 적용
+- SPI 통계, heartbeat 등 반복 로그가 시리얼 모니터를 압도하는 문제 해결
+
+### 로그 레벨 정의 (공통)
+- **LOG_NONE (0)** — 출력 완전 차단 (배포/생산)
+- **LOG_INFO (1)** — 핵심 이벤트만 (부팅, 연결, OTA, 에러) [기본값]
+- **LOG_DEBUG (2)** — 전부 출력 (SPI 상세, 모터, 프레임, 워치독, heartbeat 등)
+
+### S3 (DeepCoS3_Robot) 변경
+- **`config.h`**: `CFG_ENABLE_USB_SERIAL_DEBUG` 제거 → `CFG_LOG_LEVEL` + `CFG_LOG_USB` 도입
+- **`logInfo()` / `logDebug()`** 함수 신규 — 레벨 필터링 후 USB Serial + Serial1(UART) 동시 출력
+- **`linkLogf` → `#define linkLogf logInfo`** 하위 호환 매크로 유지
+- **`@debug,0/1/2`** 런타임 명령으로 3단계 변경 (기존 0/1 토글 확장)
+- 부팅 메시지에 버전 + 로그 레벨 표시: `DeepCoS3_Robot boot (v0.1.10, log=1)`
+- 부팅 진단에 로그 레벨/USB 상태 표시: `Boot diag: cam=OK spi=OK log=INFO(1) usb=ON`
+- **INFO 분류**: 부팅, OTA 전체, Camera/SPI init 실패, mutex 실패, 태스크 시작
+- **DEBUG 분류**: SPI 핀 상세, JSON 파싱 에러, UART overflow, 워치독 timeout
+
+### RTL (DeepCoRTL_Bridge) 변경
+- **`config.h`**: `LOG_NONE/INFO/DEBUG` 상수 + `CFG_LOG_LEVEL` 추가
+- **`RTL_INFO()` / `RTL_DEBUG()`** 매크로 신규 — `g_logLevel` 기반 필터링
+- **`@debug,0/1/2`** USB 시리얼 명령 추가 (RTL 자체 로그 레벨 변경)
+- **`@s3debug,0/1/2`** 3단계 지원 (기존 0/1에서 확장)
+- 부팅 메시지에 버전 + 로그 레벨 표시: `DeepCoRTL_Bridge boot (v0.1.10, log=INFO)`
+- 도움말에 `@debug,0|1|2` 추가
+- **INFO 분류**: 부팅, AP/WS 연결, OTA 전체, Passthru 모드, 에러
+- **DEBUG 분류**: SPI fps/통계, Task heartbeat, malloc 경고, 핀 매핑, 자동채널 상세
+
+### 런타임 명령 요약
+
+| 명령 | 대상 | 효과 |
+|------|------|------|
+| `@debug,0` | RTL | RTL 로그 OFF |
+| `@debug,1` | RTL | RTL 핵심 로그만 |
+| `@debug,2` | RTL | RTL 전부 출력 |
+| `@s3debug,0` | RTL→S3 | S3 로그 OFF |
+| `@s3debug,1` | RTL→S3 | S3 핵심 로그만 |
+| `@s3debug,2` | RTL→S3 | S3 전부 출력 |
+
+### 변경 파일
+- `esp32s3/DeepCoS3_Robot/config.h` — 로그 레벨 상수 + CFG_LOG_LEVEL/CFG_LOG_USB 추가
+- `esp32s3/DeepCoS3_Robot/DeepCoS3_Robot.ino` — logInfo/logDebug 함수, @debug 3단계, 로그 분류
+- `rtl8720dn/DeepCoRTL_Bridge/config.h` — 로그 레벨 상수 + CFG_LOG_LEVEL 추가
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — RTL_INFO/RTL_DEBUG 매크로, @debug 명령, 로그 분류
+
+---
+
 ## [v0.1.8] — 2026-02-11 — SPI CRC16 무결성 + S3 안전성 강화 + 코드 품질 개선
 
 ### 배경

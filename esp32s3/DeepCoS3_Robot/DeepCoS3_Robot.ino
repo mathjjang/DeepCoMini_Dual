@@ -1,6 +1,6 @@
 /*
   DeepCoS3_Robot.ino (ESP32‑S3, Arduino IDE)
-  FW Version: 0.1.9  (config.h CFG_FW_VERSION 과 일치시킬 것)
+  FW Version: 0.1.10  (config.h CFG_FW_VERSION 과 일치시킬 것)
 
   목표:
   - 기존 DeepcoMini_v1.3의 "카메라/모터/LED/커맨드 파싱"을 유지
@@ -30,25 +30,45 @@
 // - 디버그 로그는 Serial1로 RTL에 전달해서 RTL USB 콘솔에서 확인
 // - 포맷: "@log,<text>\n"
 // -----------------------------
-// v0.1.3: 런타임 디버그 토글 — @debug,0/@debug,1 명령 또는 RTL에서 @s3debug,0/1
-static bool g_usbDebugEnabled = CFG_ENABLE_USB_SERIAL_DEBUG;
+// v0.1.10: 3단계 로그 레벨 — LOG_NONE / LOG_INFO / LOG_DEBUG
+// 런타임 변경: @debug,0 / @debug,1 / @debug,2
+static uint8_t g_logLevel = CFG_LOG_LEVEL;
+static bool    g_logUsb   = CFG_LOG_USB;
 
-static void linkLogf(const char* fmt, ...) {
+// 내부 출력 공통 함수 (레벨 필터링 완료 후 호출)
+static void _logOutput(const char* buf) {
+  if (g_logUsb) {
+    Serial.print("[S3] ");
+    Serial.println(buf);
+  }
+  Serial1.print("@log,");
+  Serial1.println(buf);
+}
+
+// logInfo: LOG_INFO 이상일 때 출력 (부팅, 연결, OTA, 에러 등 핵심 이벤트)
+static void logInfo(const char* fmt, ...) {
+  if (g_logLevel < LOG_INFO) return;
   char buf[256];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-#if 1
-  // PC가 S3를 직접 USB로 연결해 디버깅할 때만 사용
-  if (g_usbDebugEnabled) {
-    Serial.print("[S3] ");
-    Serial.println(buf);
-  }
-#endif
-  Serial1.print("@log,");
-  Serial1.println(buf);
+  _logOutput(buf);
 }
+
+// logDebug: LOG_DEBUG 이상일 때 출력 (SPI 상세, 모터 명령, 프레임, 워치독 등)
+static void logDebug(const char* fmt, ...) {
+  if (g_logLevel < LOG_DEBUG) return;
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  _logOutput(buf);
+}
+
+// 하위 호환: 기존 linkLogf 호출을 유지하되 logInfo로 동작
+#define linkLogf logInfo
 
 // -----------------------------
 // Task split (v1.3 스타일로 분리)
@@ -233,7 +253,7 @@ static bool spiSlaveInit() {
 
   esp_err_t err = spi_slave_initialize(SPI2_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
   if (err != ESP_OK) {
-    linkLogf("spi_slave_initialize failed: 0x%x", err);
+    logInfo("spi_slave_initialize failed: 0x%x", err);
     // v0.1.2: 에러 전파
     Serial1.printf("@err,SPI_INIT,SPI slave init failed: 0x%x\n", err);
     return false;
@@ -243,7 +263,7 @@ static bool spiSlaveInit() {
     g_spiTx[i] = (uint8_t*)heap_caps_malloc(SPI_BLOCK_BYTES, MALLOC_CAP_DMA);
     g_spiRx[i] = (uint8_t*)heap_caps_malloc(SPI_BLOCK_BYTES, MALLOC_CAP_DMA);
     if (!g_spiTx[i] || !g_spiRx[i]) {
-      linkLogf("spi dma malloc failed");
+      logInfo("spi dma malloc failed");
       return false;
     }
     fillTxBlock(g_spiTx[i]);
@@ -253,13 +273,13 @@ static bool spiSlaveInit() {
     g_trans[i].rx_buffer = g_spiRx[i];
     err = spi_slave_queue_trans(SPI2_HOST, &g_trans[i], portMAX_DELAY);
     if (err != ESP_OK) {
-      linkLogf("spi_slave_queue_trans failed: 0x%x", err);
+      logInfo("spi_slave_queue_trans failed: 0x%x", err);
       return false;
     }
   }
 
   g_lastSpiActivityMs = millis();
-  linkLogf("SPI slave initialized");
+  logInfo("SPI slave initialized");
   return true;
 }
 
@@ -313,7 +333,7 @@ static void handleSpiOtaBlock(const uint8_t* rxBuf) {
       if (g_s3Ota.active) {
         Update.abort();
         g_s3Ota.active = false;
-        linkLogf("OTA cancelled by RTL");
+        logInfo("OTA cancelled by RTL");
       }
       return;
     }
@@ -325,12 +345,12 @@ static void handleSpiOtaBlock(const uint8_t* rxBuf) {
     g_s3Ota.error = false;
     g_s3Ota.rebootPending = false;
 
-    linkLogf("OTA begin: %lu bytes", (unsigned long)hdr->total_len);
+    logInfo("OTA begin: %lu bytes", (unsigned long)hdr->total_len);
 
     if (!Update.begin(hdr->total_len)) {
       g_s3Ota.error = true;
       g_s3Ota.active = false;
-      linkLogf("OTA Update.begin() failed");
+      logInfo("OTA Update.begin() failed");
     }
     return; // START 블록에는 payload 없음
   }
@@ -343,7 +363,7 @@ static void handleSpiOtaBlock(const uint8_t* rxBuf) {
       Update.abort();
       g_s3Ota.active = false;
       g_s3Ota.error = true;
-      linkLogf("OTA aborted by RTL (end+err)");
+      logInfo("OTA aborted by RTL (end+err)");
       return;
     }
 
@@ -351,7 +371,7 @@ static void handleSpiOtaBlock(const uint8_t* rxBuf) {
       Update.abort();
       g_s3Ota.error = true;
       g_s3Ota.active = false;
-      linkLogf("OTA size mismatch: got %lu expected %lu",
+      logInfo("OTA size mismatch: got %lu expected %lu",
                (unsigned long)g_s3Ota.received,
                (unsigned long)g_s3Ota.expectedSize);
       return;
@@ -360,11 +380,11 @@ static void handleSpiOtaBlock(const uint8_t* rxBuf) {
     if (!Update.end(true)) {
       g_s3Ota.error = true;
       g_s3Ota.active = false;
-      linkLogf("OTA Update.end() failed");
+      logInfo("OTA Update.end() failed");
       return;
     }
 
-    linkLogf("OTA SUCCESS: %lu bytes, rebooting in 2s",
+    logInfo("OTA SUCCESS: %lu bytes, rebooting in 2s",
              (unsigned long)g_s3Ota.received);
     g_s3Ota.active = false;
     g_s3Ota.rebootPending = true;
@@ -378,7 +398,7 @@ static void handleSpiOtaBlock(const uint8_t* rxBuf) {
   if (pl == 0) return;
   if (pl > SPI_BLOCK_BYTES - sizeof(DcmSpiHdr)) {
     g_s3Ota.error = true;
-    linkLogf("OTA payload too large: %u", pl);
+    logInfo("OTA payload too large: %u", pl);
     return;
   }
 
@@ -386,7 +406,7 @@ static void handleSpiOtaBlock(const uint8_t* rxBuf) {
   const uint16_t calcCrc = crc16Ccitt(payload, pl);
   if (calcCrc != hdr->crc16) {
     g_s3Ota.error = true;
-    linkLogf("OTA CRC error: calc=0x%04X hdr=0x%04X", calcCrc, hdr->crc16);
+    logInfo("OTA CRC error: calc=0x%04X hdr=0x%04X", calcCrc, hdr->crc16);
     return;
   }
 
@@ -394,7 +414,7 @@ static void handleSpiOtaBlock(const uint8_t* rxBuf) {
   const size_t written = Update.write((uint8_t*)payload, pl);
   if (written != pl) {
     g_s3Ota.error = true;
-    linkLogf("OTA write fail: wrote %u / %u", (unsigned)written, (unsigned)pl);
+    logInfo("OTA write fail: wrote %u / %u", (unsigned)written, (unsigned)pl);
     return;
   }
   g_s3Ota.received += pl;
@@ -429,7 +449,7 @@ static void spiSlavePoll() {
 
   // v0.1.9: OTA 후 지연 리부팅
   if (g_s3Ota.rebootPending && millis() >= g_s3Ota.rebootAtMs) {
-    linkLogf("OTA reboot now");
+    logInfo("OTA reboot now");
     delay(100);
     ESP.restart();
   }
@@ -629,7 +649,7 @@ static void configCamera() {
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    linkLogf("Camera init failed: 0x%x", err);
+    logInfo("Camera init failed: 0x%x", err);
     g_cameraInitOk = false;
     // v0.1.2: 에러 전파 — RTL이 WS로 중계
     Serial1.printf("@err,CAM_INIT,Camera init failed: 0x%x\n", err);
@@ -726,7 +746,7 @@ static void robotMoveJson(const char* json) {
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, json);
   if (err != DeserializationError::Ok) {
-    linkLogf("robot json parse failed: %s", err.c_str());
+    logDebug("robot json parse failed: %s", err.c_str());
     return;
   }
   JsonObject obj = doc.as<JsonObject>();
@@ -786,13 +806,24 @@ static void handleCommandLine(const char* line) {
     return;
   }
 
-  // v0.1.3: @debug,0/@debug,1 — USB Serial 디버그 토글
+  // v0.1.10: @debug,0/1/2 — 3단계 로그 레벨 변경
   if (strncmp(line, "@debug,", 7) == 0) {
     const char v = line[7] ? line[7] : '0';
-    g_usbDebugEnabled = (v == '1');
-    linkLogf("USB debug %s", g_usbDebugEnabled ? "ON" : "OFF");
-    if (g_usbDebugEnabled) {
-      Serial.printf("[S3] USB debug enabled via command\n");
+    const uint8_t newLevel = (uint8_t)(v - '0');
+    if (newLevel <= LOG_DEBUG) {
+      g_logLevel = newLevel;
+    } else {
+      g_logLevel = LOG_NONE;
+    }
+    // 레벨 변경 알림은 항상 출력 (Serial1 경유)
+    {
+      static const char* levelNames[] = {"NONE", "INFO", "DEBUG"};
+      const char* name = (g_logLevel <= LOG_DEBUG) ? levelNames[g_logLevel] : "?";
+      char buf[64];
+      snprintf(buf, sizeof(buf), "Log level -> %s (%d)", name, g_logLevel);
+      // 강제 출력 (레벨 무관)
+      if (g_logUsb) { Serial.print("[S3] "); Serial.println(buf); }
+      Serial1.print("@log,"); Serial1.println(buf);
     }
     return;
   }
@@ -850,7 +881,7 @@ static bool readLineFromSerial1(char* outLine, size_t outLen) {
     if (ch == '\r') continue;
     if (ch == '\n') {
       if (overflowed) {
-        linkLogf("UART line overflow (>512), line dropped");
+        logDebug("UART line overflow (>512), line dropped");
         pos = 0;
         overflowed = false;
         return false;
@@ -876,9 +907,9 @@ void setup() {
   // v0.1.3: USB Serial은 항상 초기화 (런타임 디버그 토글 지원)
   Serial.begin(115200);
   delay(200);
-  linkLogf("DeepCoS3_Robot boot");
-  linkLogf("Serial1 baud=%u RX=%d TX=%d", (unsigned)LINK_BAUD, LINK_RX_PIN, LINK_TX_PIN);
-  linkLogf("SPI slave pins: CS=%d SCLK=%d MISO=%d MOSI=%d (block=%u bytes)",
+  logInfo("DeepCoS3_Robot boot (v%s, log=%d)", CFG_FW_VERSION, g_logLevel);
+  logInfo("Serial1 baud=%u RX=%d TX=%d", (unsigned)LINK_BAUD, LINK_RX_PIN, LINK_TX_PIN);
+  logDebug("SPI slave pins: CS=%d SCLK=%d MISO=%d MOSI=%d (block=%u bytes)",
            SPI_CS_PIN, SPI_SCLK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN, (unsigned)SPI_BLOCK_BYTES);
 
   // LEDs
@@ -926,7 +957,7 @@ void setup() {
   // Camera frame shared-state mutex
   g_frameMutex = xSemaphoreCreateMutex();
   if (!g_frameMutex) {
-    linkLogf("WARN: frame mutex create failed");
+    logInfo("WARN: frame mutex create failed");
   }
 
   // SPI slave init (camera stream)
@@ -943,16 +974,19 @@ void setup() {
     xTaskCreatePinnedToCore(taskRobotCtrl, "robot_ctrl", 4096, NULL, 2, &g_taskRobotCtrl, 1);
     // LED는 저우선순위로 상태 표시
     xTaskCreatePinnedToCore(taskLed, "led", 3072, NULL, 1, &g_taskLed, 1);
-    linkLogf("Tasks started: spi_cam(core0) + robot_ctrl(core1) + led(core1)");
+    logInfo("Tasks started: spi_cam(core0) + robot_ctrl(core1) + led(core1)");
   } else {
-    linkLogf("Tasks disabled: using loop() polling");
+    logInfo("Tasks disabled: using loop() polling");
   }
 
-  // v0.1.3: 부팅 진단 요약
-  linkLogf("Boot diag: cam=%s spi=%s debug=%s",
+  // v0.1.10: 부팅 진단 요약 (로그 레벨 표시)
+  static const char* levelNames[] = {"NONE", "INFO", "DEBUG"};
+  logInfo("Boot diag: cam=%s spi=%s log=%s(%d) usb=%s",
            g_cameraInitOk ? "OK" : "FAIL",
            g_spiInitOk ? "OK" : "FAIL",
-           g_usbDebugEnabled ? "ON" : "OFF");
+           (g_logLevel <= LOG_DEBUG) ? levelNames[g_logLevel] : "?",
+           g_logLevel,
+           g_logUsb ? "ON" : "OFF");
 }
 
 void loop() {
@@ -1012,7 +1046,7 @@ static void taskRobotCtrl(void* arg) {
     if ((millis() - lastCmdMs) > CMD_WATCHDOG_MS) {
       stopRobot();
       if (!watchdogStopped) {
-        linkLogf("command watchdog stop (>%lums no UART command)", (unsigned long)CMD_WATCHDOG_MS);
+        logDebug("command watchdog stop (>%lums no UART command)", (unsigned long)CMD_WATCHDOG_MS);
         watchdogStopped = true;
       }
     }

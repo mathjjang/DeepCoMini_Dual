@@ -1,21 +1,22 @@
 # DeepCoS3_Robot OTA Partition Table
-# ESP32-S3 8MB Flash (0x800000)
+# ESP32-S3 16MB Flash (0x1000000)
 #
 # Layout:
 #   0x000000  Bootloader (2nd stage, 36KB)
 #   0x008000  Partition table (4KB)
 #   0x009000  nvs          20KB
 #   0x00E000  otadata       8KB
-#   0x010000  ota_0      3968KB  (3.875MB)
-#   0x3F0000  ota_1      3968KB  (3.875MB)
-#   0x7D0000  spiffs      192KB
-#   0x800000  END
+#   0x010000  ota_0      7936KB  (7.75MB)
+#   0x7C0000  ota_1      7936KB  (7.75MB)
+#   0xF70000  spiffs      576KB
+#   0x1000000 END
 #
-# Max firmware size: ~3.87MB
+# Max firmware size: ~7.75MB
 #
 # Usage:
-#   1. Arduino IDE -> Tools -> Flash Size -> "8MB"
-#   2. This file in sketch folder overrides the selected partition scheme automatically
+#   1. Arduino IDE -> Tools -> Flash Size -> "16MB"
+#   2. Copy this file to sketch folder as "partitions.csv"
+#      (overrides the selected partition scheme automatically)
 #
 # OTA Operation:
 #   1st: ota_0 runs -> writes new firmware to ota_1 -> reboot -> ota_1 runs
@@ -24,6 +25,6 @@
 # Name,    Type, SubType, Offset,   Size,     Flags
 nvs,       data, nvs,     0x9000,   0x5000,
 otadata,   data, ota,     0xe000,   0x2000,
-ota_0,     app,  ota_0,   0x10000,  0x3E0000,
-ota_1,     app,  ota_1,   0x3F0000, 0x3E0000,
-spiffs,    data, spiffs,  0x7D0000, 0x30000,
+ota_0,     app,  ota_0,   0x10000,  0x7B0000,
+ota_1,     app,  ota_1,   0x7C0000, 0x7B0000,
+spiffs,    data, spiffs,  0xF70000, 0x90000,

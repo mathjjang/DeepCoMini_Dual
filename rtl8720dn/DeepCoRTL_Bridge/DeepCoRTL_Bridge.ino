@@ -1,6 +1,6 @@
 /*
   DeepCoRTL_Bridge.ino (RTL8720DN / BW16 등, Arduino IDE)
-  FW Version: 0.1.9  (config.h CFG_FW_VERSION 과 일치시킬 것)
+  FW Version: 0.1.10  (config.h CFG_FW_VERSION 과 일치시킬 것)
 
   목표:
   - RTL8720DN이 Wi‑Fi AP + WebSocket 서버를 제공 (로봇 IP = 192.168.4.1)
@@ -47,6 +47,21 @@ extern "C" {
 // -------------------------------------------------------
 #define RTL_PRINTF(ser, fmt, ...) \
   do { char _pf[192]; snprintf(_pf, sizeof(_pf), fmt, ##__VA_ARGS__); ser.print(_pf); } while(0)
+
+// v0.1.10: 3단계 로그 레벨 매크로
+static uint8_t g_logLevel = CFG_LOG_LEVEL;
+
+// INFO: 부팅, 연결, OTA, 에러 등 핵심 이벤트
+#define RTL_INFO(ser, fmt, ...) \
+  do { if (g_logLevel >= LOG_INFO) RTL_PRINTF(ser, fmt, ##__VA_ARGS__); } while(0)
+
+// DEBUG: SPI 통계, heartbeat, 성능, 상세 로그
+#define RTL_DEBUG(ser, fmt, ...) \
+  do { if (g_logLevel >= LOG_DEBUG) RTL_PRINTF(ser, fmt, ##__VA_ARGS__); } while(0)
+
+// 레벨 무관 항상 출력 (Serial.println 대체용)
+#define RTL_LOG_ALWAYS(ser, msg) \
+  do { if (g_logLevel >= LOG_INFO) ser.println(msg); } while(0)
 
 // -----------------------------
 // Optional: split work into RTOS tasks (if available)
@@ -148,7 +163,7 @@ static int pickChannelFromMac() {
   WiFi.macAddress(mac);
   int idx = mac[5] % CFG_AP_CHANNEL_POOL_SIZE;
   int ch = channelPool[idx];
-  RTL_PRINTF(Serial, "[RTL] Auto-channel: MAC[5]=0x%02X → pool[%d] = ch %d\n", mac[5], idx, ch);
+  RTL_DEBUG(Serial, "[RTL] Auto-channel: MAC[5]=0x%02X -> pool[%d] = ch %d\n", mac[5], idx, ch);
   return ch;
 #else
   return CFG_AP_CHANNEL_DEFAULT;
@@ -243,10 +258,10 @@ static bool otaChooseAddress() {
     g_ota.addrNew = OTA_ADDR_2;
     g_ota.addrOld = OTA_ADDR_1;
   } else {
-    Serial.println("[OTA] ERR: no valid image found in flash");
+    RTL_INFO(Serial, "[OTA] ERR: no valid image found in flash\n");
     return false;
   }
-  RTL_PRINTF(Serial, "[OTA] target=0x%06X, current=0x%06X\n",
+  RTL_INFO(Serial, "[OTA] target=0x%06X, current=0x%06X\n",
              (unsigned)g_ota.addrNew, (unsigned)g_ota.addrOld);
   return true;
 }
@@ -254,12 +269,12 @@ static bool otaChooseAddress() {
 // OTA: Flash 섹터 삭제 (이미지 크기만큼)
 static bool otaEraseFlash(uint32_t imageSize) {
   const uint32_t sectors = (imageSize + OTA_SECTOR_SZ - 1) / OTA_SECTOR_SZ;
-  RTL_PRINTF(Serial, "[OTA] erasing %lu sectors (%lu bytes)...\n",
+  RTL_INFO(Serial, "[OTA] erasing %lu sectors (%lu bytes)...\n",
              (unsigned long)sectors, (unsigned long)imageSize);
   for (uint32_t i = 0; i < sectors; i++) {
     flash_erase_sector(&g_ota.flash, g_ota.addrNew + i * OTA_SECTOR_SZ);
   }
-  Serial.println("[OTA] erase done");
+  RTL_INFO(Serial, "[OTA] erase done\n");
   return true;
 }
 
@@ -303,7 +318,7 @@ static void otaBegin(uint32_t imageSize) {
   g_ota.checksum = 0;
   g_ota.startMs = millis();
 
-  RTL_PRINTF(Serial, "[OTA] started: size=%lu\n", (unsigned long)imageSize);
+  RTL_INFO(Serial, "[OTA] started: size=%lu\n", (unsigned long)imageSize);
   if (controlClientConnected())
     wsControl.sendTXT(g_controlClientNum, "@ota,ready");
 }
@@ -321,14 +336,14 @@ static void otaWriteChunk(const uint8_t* data, size_t len) {
   const size_t payloadLen = len - 8;
 
   if (chunkLen != payloadLen || (offset + chunkLen) > g_ota.expectedSize) {
-    RTL_PRINTF(Serial, "[OTA] ERR: bad chunk off=%lu len=%lu payload=%lu\n",
+    RTL_INFO(Serial, "[OTA] ERR: bad chunk off=%lu len=%lu payload=%lu\n",
                (unsigned long)offset, (unsigned long)chunkLen, (unsigned long)payloadLen);
     return;
   }
 
   // Flash 기록
   if (flash_stream_write(&g_ota.flash, g_ota.addrNew + offset, chunkLen, (uint8_t*)payload) < 0) {
-    Serial.println("[OTA] ERR: flash write fail");
+    RTL_INFO(Serial, "[OTA] ERR: flash write fail\n");
     if (controlClientConnected())
       wsControl.sendTXT(g_controlClientNum, "@ota,error,flash_write_fail");
     g_ota.active = false;
@@ -346,12 +361,12 @@ static void otaWriteChunk(const uint8_t* data, size_t len) {
 static void otaEnd(uint32_t reportedSize) {
   if (!g_ota.active) return;
 
-  RTL_PRINTF(Serial, "[OTA] end: received=%lu, expected=%lu, reported=%lu\n",
+  RTL_INFO(Serial, "[OTA] end: received=%lu, expected=%lu, reported=%lu\n",
              (unsigned long)g_ota.received, (unsigned long)g_ota.expectedSize,
              (unsigned long)reportedSize);
 
   if (g_ota.received != g_ota.expectedSize || reportedSize != g_ota.expectedSize) {
-    Serial.println("[OTA] ERR: size mismatch");
+    RTL_INFO(Serial, "[OTA] ERR: size mismatch\n");
     // 실패: 새 이미지 무효화, 기존 복원
     flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
     flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
@@ -374,7 +389,7 @@ static void otaEnd(uint32_t reportedSize) {
   }
 
   if (flashChecksum != g_ota.checksum) {
-    RTL_PRINTF(Serial, "[OTA] ERR: checksum mismatch (ram=%08X flash=%08X)\n",
+    RTL_INFO(Serial, "[OTA] ERR: checksum mismatch (ram=%08X flash=%08X)\n",
                (unsigned)g_ota.checksum, (unsigned)flashChecksum);
     flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
     flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
@@ -393,7 +408,7 @@ static void otaEnd(uint32_t reportedSize) {
   flash_read_word(&g_ota.flash, g_ota.addrNew + 0, &s1);
   flash_read_word(&g_ota.flash, g_ota.addrNew + 4, &s2);
   if (s1 != OTA_SIG_VALID || s2 != OTA_SIG_VALID2) {
-    Serial.println("[OTA] ERR: signature write failed");
+    RTL_INFO(Serial, "[OTA] ERR: signature write failed\n");
     g_ota.active = false;
     if (controlClientConnected())
       wsControl.sendTXT(g_controlClientNum, "@ota,error,signature_fail");
@@ -404,7 +419,7 @@ static void otaEnd(uint32_t reportedSize) {
   flash_write_word(&g_ota.flash, g_ota.addrOld + 0, OTA_SIG_INVALID);
 
   const uint32_t elapsed = (millis() - g_ota.startMs) / 1000;
-  RTL_PRINTF(Serial, "[OTA] SUCCESS: %lu bytes in %lus, checksum=%08X\n",
+  RTL_INFO(Serial, "[OTA] SUCCESS: %lu bytes in %lus, checksum=%08X\n",
              (unsigned long)g_ota.received, (unsigned long)elapsed, (unsigned)g_ota.checksum);
   g_ota.active = false;
 
@@ -419,7 +434,7 @@ static void otaEnd(uint32_t reportedSize) {
 // OTA 취소
 static void otaCancel() {
   if (!g_ota.active) return;
-  Serial.println("[OTA] cancelled");
+  RTL_INFO(Serial, "[OTA] cancelled\n");
   // 새 이미지 무효화, 기존 복원
   flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
   flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
@@ -462,7 +477,7 @@ static bool spiCheckS3Ack(const uint8_t* block) {
       ack->magic[2] != 'M' || ack->magic[3] != '2') return true; // S3 아직 응답 전 (idle) — OK
   if (ack->type == SPI_TYPE_OTA_ACK) {
     if (ack->flags & SPI_FLAG_OTA_ERR) {
-      Serial.println("[OTA-S3] S3 reported error");
+      RTL_INFO(Serial, "[OTA-S3] S3 reported error\n");
       return false;
     }
   }
@@ -519,7 +534,7 @@ static void otaS3Begin(uint32_t imageSize) {
   g_otaS3.startMs = millis();
 
   // 첫 SPI 블록: START flag + 페이로드 0 (S3에게 OTA 시작 알림)
-  RTL_PRINTF(Serial, "[OTA-S3] start: size=%lu\n", (unsigned long)imageSize);
+  RTL_INFO(Serial, "[OTA-S3] start: size=%lu\n", (unsigned long)imageSize);
   if (!spiSendOtaBlock(nullptr, 0, 0, imageSize, SPI_FLAG_START)) {
     g_otaS3.active = false;
     if (controlClientConnected())
@@ -571,7 +586,7 @@ static void otaS3WriteChunk(const uint8_t* data, size_t len) {
 static void otaS3End(uint32_t reportedSize) {
   if (!g_otaS3.active) return;
 
-  RTL_PRINTF(Serial, "[OTA-S3] end: sent=%lu expected=%lu\n",
+  RTL_INFO(Serial, "[OTA-S3] end: sent=%lu expected=%lu\n",
              (unsigned long)g_otaS3.sent, (unsigned long)g_otaS3.expectedSize);
 
   if (g_otaS3.sent != g_otaS3.expectedSize || reportedSize != g_otaS3.expectedSize) {
@@ -602,14 +617,14 @@ static void otaS3End(uint32_t reportedSize) {
       finalAck->type == SPI_TYPE_OTA_ACK &&
       (finalAck->flags & SPI_FLAG_OTA_ERR)) {
     g_otaS3.active = false;
-    Serial.println("[OTA-S3] S3 reported final error");
+    RTL_INFO(Serial, "[OTA-S3] S3 reported final error\n");
     if (controlClientConnected())
       wsControl.sendTXT(g_controlClientNum, "@ota,error,s3_verify_fail");
     return;
   }
 
   const uint32_t elapsed = (millis() - g_otaS3.startMs) / 1000;
-  RTL_PRINTF(Serial, "[OTA-S3] SUCCESS: %lu bytes in %lus\n",
+  RTL_INFO(Serial, "[OTA-S3] SUCCESS: %lu bytes in %lus\n",
              (unsigned long)g_otaS3.sent, (unsigned long)elapsed);
   g_otaS3.active = false;
 
@@ -621,7 +636,7 @@ static void otaS3End(uint32_t reportedSize) {
 // S3 OTA 취소
 static void otaS3Cancel() {
   if (!g_otaS3.active) return;
-  Serial.println("[OTA-S3] cancelled");
+  RTL_INFO(Serial, "[OTA-S3] cancelled\n");
   // END with error flag 전송 (S3가 OTA 포기)
   spiSendOtaBlock(nullptr, 0, 0, 0, SPI_FLAG_END | SPI_FLAG_OTA_ERR);
   g_otaS3.active = false;
@@ -660,7 +675,7 @@ static void enterS3BootMode() {
   digitalWrite(CFG_S3_EN_PIN, HIGH);
   delay(50);
 
-  Serial.println("[RTL] S3 entered BOOT mode (GPIO0=LOW, EN toggled)");
+  RTL_INFO(Serial, "[RTL] S3 entered BOOT mode (GPIO0=LOW, EN toggled)\n");
 }
 
 // S3를 정상 모드로 리셋 (GPIO0=HIGH 상태에서 EN 리셋)
@@ -679,7 +694,7 @@ static void resetS3Normal() {
   pinMode(CFG_S3_BOOT_PIN, INPUT);
   pinMode(CFG_S3_EN_PIN, INPUT);
 
-  Serial.println("[RTL] S3 reset to NORMAL mode");
+  RTL_INFO(Serial, "[RTL] S3 reset to NORMAL mode\n");
 }
 
 // USB↔UART 투명 브릿지 루프
@@ -687,10 +702,10 @@ static void resetS3Normal() {
 // 기본 115200으로 시작, esptool이 change_baud 시 UART도 변경 필요
 // (현재는 고정 보드레이트, 향후 자동 감지 가능)
 static void runPassthruBridge() {
-  Serial.println("[RTL] === PASSTHRU MODE START ===");
-  Serial.println("[RTL] USB <-> UART transparent bridge active");
-  Serial.println("[RTL] Press Ctrl+C x3 rapidly to force-exit");
-  RTL_PRINTF(Serial, "[RTL] Timeout: %d ms (no data = exit)\n", CFG_PASSTHRU_TIMEOUT_MS);
+  RTL_INFO(Serial, "[RTL] === PASSTHRU MODE START ===\n");
+  RTL_INFO(Serial, "[RTL] USB <-> UART transparent bridge active\n");
+  RTL_INFO(Serial, "[RTL] Press Ctrl+C x3 rapidly to force-exit\n");
+  RTL_INFO(Serial, "[RTL] Timeout: %d ms (no data = exit)\n", CFG_PASSTHRU_TIMEOUT_MS);
 
   g_passthruActive = true;
 
@@ -724,7 +739,7 @@ static void runPassthruBridge() {
             if (escHits == 0) escFirstMs = millis();
             escHits++;
             if (escHits >= ESC_COUNT && (millis() - escFirstMs) < ESC_WINDOW_MS) {
-              Serial.println("\n[RTL] Ctrl+C x3 detected - force exiting passthru");
+              RTL_INFO(Serial, "\n[RTL] Ctrl+C x3 detected - force exiting passthru\n");
               g_passthruActive = false;
               break;
             }
@@ -761,7 +776,7 @@ static void runPassthruBridge() {
 
     // 타임아웃 체크
     if (millis() - lastDataTime > CFG_PASSTHRU_TIMEOUT_MS) {
-      Serial.println("\n[RTL] Passthru timeout - no data, exiting");
+      RTL_INFO(Serial, "\n[RTL] Passthru timeout - no data, exiting\n");
       break;
     }
 
@@ -775,28 +790,28 @@ static void runPassthruBridge() {
   Serial1.end();
   Serial1.begin(CFG_LINK_BAUD);
 
-  Serial.println("[RTL] === PASSTHRU MODE END ===");
+  RTL_INFO(Serial, "[RTL] === PASSTHRU MODE END ===\n");
 }
 
 // 패스스루 전체 시퀀스 실행
 static void startPassthruMode() {
-  Serial.println("[RTL] ========================================");
-  Serial.println("[RTL] S3 Flash Passthrough Mode (Option E)");
-  Serial.println("[RTL] ========================================");
+  RTL_INFO(Serial, "[RTL] ========================================\n");
+  RTL_INFO(Serial, "[RTL] S3 Flash Passthrough Mode (Option E)\n");
+  RTL_INFO(Serial, "[RTL] ========================================\n");
   sendSafetyStopToS3();
   delay(50);
-  Serial.println("[RTL] 1. Entering S3 boot mode...");
+  RTL_INFO(Serial, "[RTL] 1. Entering S3 boot mode...\n");
   enterS3BootMode();
 
-  Serial.println("[RTL] 2. Starting USB<->UART bridge...");
-  Serial.println("[RTL] >>> Use esptool / Arduino IDE to flash S3 now <<<");
+  RTL_INFO(Serial, "[RTL] 2. Starting USB<->UART bridge...\n");
+  RTL_INFO(Serial, "[RTL] >>> Use esptool / Arduino IDE to flash S3 now <<<\n");
   runPassthruBridge();
 
-  Serial.println("[RTL] 3. Resetting S3 to normal mode...");
+  RTL_INFO(Serial, "[RTL] 3. Resetting S3 to normal mode...\n");
   resetS3Normal();
 
-  Serial.println("[RTL] Passthru complete. Resuming normal operation.");
-  Serial.println("[RTL] ========================================");
+  RTL_INFO(Serial, "[RTL] Passthru complete. Resuming normal operation.\n");
+  RTL_INFO(Serial, "[RTL] ========================================\n");
 }
 
 #endif // CFG_PASSTHRU_ENABLE
@@ -1094,7 +1109,7 @@ static void onControlWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_
       }
       g_controlClientNum = num;
       hasControlClient = true;
-      Serial.println("[RTL] control WS client connected");
+      RTL_INFO(Serial, "[RTL] control WS client connected\n");
       sendLedLinkStateToS3(true);
       // 안전: 연결되자마자 stop 한번
       sendSafetyStopToS3();
@@ -1177,7 +1192,7 @@ static void onCameraWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t
       }
       g_cameraClientNum = num;
       hasCameraClient = true;
-      Serial.println("[RTL] camera WS client connected");
+      RTL_INFO(Serial, "[RTL] camera WS client connected\n");
       sendLedLinkStateToS3(true);
       break;
     }
@@ -1199,20 +1214,24 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println("[RTL] DeepCoRTL_Bridge boot");
-  RTL_PRINTF(Serial, "[RTL] Build: %s %s\n", __DATE__, __TIME__);
-  RTL_PRINTF(Serial, "[RTL] Compile detect: RTL_HAS_FREERTOS=%d, defaultTasks=%d\n",
+  {
+    static const char* levelNames[] = {"NONE", "INFO", "DEBUG"};
+    RTL_INFO(Serial, "[RTL] DeepCoRTL_Bridge boot (v%s, log=%s)\n",
+               CFG_FW_VERSION, (g_logLevel <= LOG_DEBUG) ? levelNames[g_logLevel] : "?");
+  }
+  RTL_INFO(Serial, "[RTL] Build: %s %s\n", __DATE__, __TIME__);
+  RTL_DEBUG(Serial, "[RTL] Compile detect: RTL_HAS_FREERTOS=%d, defaultTasks=%d\n",
                 (int)RTL_HAS_FREERTOS, (int)RTL_USE_TASKS);
-  RTL_PRINTF(Serial, "[RTL] Serial1 pins (fixed by variant): TX=%d(AMB_D4) RX=%d(AMB_D5)\n",
+  RTL_DEBUG(Serial, "[RTL] Serial1 pins (fixed by variant): TX=%d(AMB_D4) RX=%d(AMB_D5)\n",
                 RTL_LINK_TX_PIN, RTL_LINK_RX_PIN);
-  RTL_PRINTF(Serial, "[RTL] SPI pins (fixed by variant): SS=%d(AMB_D9) SCLK=%d(AMB_D10) MISO=%d(AMB_D11) MOSI=%d(AMB_D12)\n",
+  RTL_DEBUG(Serial, "[RTL] SPI pins (fixed by variant): SS=%d(AMB_D9) SCLK=%d(AMB_D10) MISO=%d(AMB_D11) MOSI=%d(AMB_D12)\n",
                 RTL_SPI_SS_PIN_DOC, RTL_SPI_SCLK_PIN_DOC, RTL_SPI_MISO_PIN_DOC, RTL_SPI_MOSI_PIN_DOC);
 
   // v0.1.5: S3 패스스루용 GPIO 초기화 (입력 모드 = S3가 자유롭게 사용)
 #if CFG_PASSTHRU_ENABLE
   pinMode(CFG_S3_EN_PIN, INPUT);
   pinMode(CFG_S3_BOOT_PIN, INPUT);
-  RTL_PRINTF(Serial, "[RTL] Passthru GPIO: S3_EN=%d(AMB_D8/PA26), S3_BOOT=%d(AMB_D7/PA25)\n",
+  RTL_DEBUG(Serial, "[RTL] Passthru GPIO: S3_EN=%d(AMB_D8/PA26), S3_BOOT=%d(AMB_D7/PA25)\n",
                 CFG_S3_EN_PIN, CFG_S3_BOOT_PIN);
 #endif
 
@@ -1228,7 +1247,7 @@ void setup() {
   if (RTL_USE_TASKS) {
     g_frameMutex = xSemaphoreCreateMutex();
     if (!g_frameMutex) {
-      Serial.println("[RTL] WARN: frame mutex create failed, falling back to loop() mode");
+      RTL_INFO(Serial, "[RTL] WARN: frame mutex create failed, falling back to loop() mode\n");
       // 강제 폴백 (컴파일 타임 const라서 런타임 변경은 불가) -> mutex 없는 상태로도 동작은 하지만
       // 데이터 레이스 가능성이 있어, 아래에서는 mutex 존재 여부를 체크하고 사용합니다.
     }
@@ -1247,41 +1266,42 @@ void setup() {
     g_apChannel = pickChannelFromMac();
   }
 
-  RTL_PRINTF(Serial, "[RTL] AP SSID=%s, Channel=%d\n", ssid, g_apChannel);
+  RTL_INFO(Serial, "[RTL] AP SSID=%s, Channel=%d\n", ssid, g_apChannel);
 
   int status = WiFi.apbegin(ssid, g_apPassword, g_apChannel);
   if (status != WL_CONNECTED) {
     // AmebaD는 apbegin() 리턴이 status 형태(문서상 "status of AP")
-    Serial.print("[RTL] apbegin() status = ");
-    Serial.println(status);
+    RTL_INFO(Serial, "[RTL] apbegin() status = %d\n", status);
   }
 
-  Serial.print("[RTL] AP IP = ");
-  Serial.println(WiFi.localIP());
+  {
+    IPAddress ip = WiFi.localIP();
+    RTL_INFO(Serial, "[RTL] AP IP = %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+  }
   // Initial LED link state for S3
   sendLedLinkStateToS3(true);
 
   // WebSocket servers — config.h
   wsControl.begin();
   wsControl.onEvent(onControlWsEvent);
-  RTL_PRINTF(Serial, "[RTL] WS control listening on :%d (/ws accepted)\n", CFG_WS_CONTROL_PORT);
+  RTL_INFO(Serial, "[RTL] WS control listening on :%d (/ws accepted)\n", CFG_WS_CONTROL_PORT);
 
 #if ENABLE_CAMERA_BRIDGE
   wsCamera.begin();
   wsCamera.onEvent(onCameraWsEvent);
-  RTL_PRINTF(Serial, "[RTL] WS camera listening on :%d (/ accepted)\n", CFG_WS_CAMERA_PORT);
+  RTL_INFO(Serial, "[RTL] WS camera listening on :%d (/ accepted)\n", CFG_WS_CAMERA_PORT);
 #else
-  Serial.println("[RTL] Camera bridge disabled (ENABLE_CAMERA_BRIDGE=0)");
+    RTL_INFO(Serial, "[RTL] Camera bridge disabled (ENABLE_CAMERA_BRIDGE=0)\n");
 #endif
 
 #if RTL_HAS_FREERTOS
   if (RTL_USE_TASKS) {
-    Serial.println("[RTL] Mode: RTOS tasks (will start on first loop)");
+    RTL_INFO(Serial, "[RTL] Mode: RTOS tasks (will start on first loop)\n");
   } else {
-    Serial.println("[RTL] Mode: loop() fallback (RTOS headers not found)");
+    RTL_INFO(Serial, "[RTL] Mode: loop() fallback (RTOS headers not found)\n");
   }
 #else
-  Serial.println("[RTL] Mode: loop() fallback (no RTOS headers)");
+  RTL_INFO(Serial, "[RTL] Mode: loop() fallback (no RTOS headers)\n");
 #endif
 }
 
@@ -1301,7 +1321,7 @@ static void warnRebootIfNeeded() {
   const uint32_t now = millis();
   if (now - lastWarnMs >= 10000) {
     lastWarnMs = now;
-    Serial.println("[RTL] WARN: settings changed, run @reboot to apply");
+    RTL_INFO(Serial, "[RTL] WARN: settings changed, run @reboot to apply\n");
   }
 }
 
@@ -1387,8 +1407,19 @@ static void handleSerialCommand(const char* cmd) {
       wsControl.sendTXT(g_controlClientNum, diagBuf);
     }
     RTL_PRINTF(Serial, "[RTL] Uptime: %lum %lus\n", (unsigned long)uptimeMin, (unsigned long)(uptimeSec % 60));
+  } else if (strncmp(cmd, "@debug,", 7) == 0) {
+    // v0.1.10: RTL 자체 로그 레벨 변경 (@debug,0/1/2)
+    const char v = cmd[7] ? cmd[7] : '0';
+    const uint8_t newLevel = (uint8_t)(v - '0');
+    g_logLevel = (newLevel <= LOG_DEBUG) ? newLevel : LOG_NONE;
+    {
+      static const char* levelNames[] = {"NONE", "INFO", "DEBUG"};
+      const char* name = (g_logLevel <= LOG_DEBUG) ? levelNames[g_logLevel] : "?";
+      // 강제 출력 (레벨 무관)
+      RTL_PRINTF(Serial, "[RTL] Log level -> %s (%d)\n", name, g_logLevel);
+    }
   } else if (strncmp(cmd, "@s3debug,", 9) == 0) {
-    // v0.1.3: S3 USB 디버그 토글 명령 전달
+    // v0.1.10: S3 로그 레벨 변경 명령 전달 (@s3debug,0/1/2)
     const char v = cmd[9] ? cmd[9] : '0';
     RTL_PRINTF(Serial1, "@debug,%c\n", v);
     RTL_PRINTF(Serial, "[RTL] Sent @debug,%c to S3\n", v);
@@ -1425,7 +1456,7 @@ static void handleSerialCommand(const char* cmd) {
 #endif
   else {
     RTL_PRINTF(Serial, "[RTL] Unknown command: %s\n", cmd);
-    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @s3debug,0|1 / @diag / @reboot / @info"
+    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @debug,0|1|2 / @s3debug,0|1|2 / @diag / @reboot / @info"
 #if CFG_PASSTHRU_ENABLE
                    " / @passthru"
 #endif
@@ -1539,7 +1570,7 @@ void loop() {
     const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
     const float fps = (float)sFrm / secs;
     const float kbps = ((float)sByt / 1024.0f) / secs;
-    RTL_PRINTF(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu crc_err=%lu\n",
+    RTL_DEBUG(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu crc_err=%lu\n",
                   fps, (unsigned long)sBlk, kbps,
                   (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs, (unsigned long)sCrcE);
   }
@@ -1607,7 +1638,7 @@ static void taskWsUart(void* arg) {
       const uint32_t nowMs = millis();
       if (mallocFailCount > 0 && (nowMs - lastMallocFailLogMs) >= 5000) {
         lastMallocFailLogMs = nowMs;
-        RTL_PRINTF(Serial, "[RTL][WS] WARN: tx malloc failed %lu times\n", (unsigned long)mallocFailCount);
+        RTL_DEBUG(Serial, "[RTL][WS] WARN: tx malloc failed %lu times\n", (unsigned long)mallocFailCount);
       }
     }
 
@@ -1620,7 +1651,7 @@ static void taskWsUart(void* arg) {
       const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
       const float fps = (float)sFrm / secs;
       const float kbps = ((float)sByt / 1024.0f) / secs;
-      RTL_PRINTF(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu crc_err=%lu\n",
+      RTL_DEBUG(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu crc_err=%lu\n",
                     fps, (unsigned long)sBlk, kbps,
                     (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs, (unsigned long)sCrcE);
     }
@@ -1634,7 +1665,7 @@ static void taskWsUart(void* arg) {
     const uint32_t nowBeat = millis();
     if (nowBeat - lastBeatMs >= 5000) {
       lastBeatMs = nowBeat;
-      RTL_PRINTF(Serial, "[RTL][TASK] ws_uart alive (wantStream=%d)\n", (int)g_wantStream);
+      RTL_DEBUG(Serial, "[RTL][TASK] ws_uart alive (wantStream=%d)\n", (int)g_wantStream);
     }
 
     // WS/UART은 응답성이 중요: 짧게 양보
@@ -1663,7 +1694,7 @@ static void taskSpiPull(void* arg) {
     const uint32_t nowBeat = millis();
     if (nowBeat - lastBeatMs >= 5000) {
       lastBeatMs = nowBeat;
-      RTL_PRINTF(Serial, "[RTL][TASK] spi_pull alive (seq=%u len=%u)\n",
+      RTL_DEBUG(Serial, "[RTL][TASK] spi_pull alive (seq=%u len=%u)\n",
                     (unsigned)g_frameSeq, (unsigned)g_frameLen);
     }
 #else
@@ -1688,10 +1719,10 @@ static void ensureTasksStartedOnce() {
 
   if (okA == pdPASS && okB == pdPASS) {
     g_tasksStartedRuntime = true;
-    Serial.println("[RTL] Runtime: tasks started OK (ws_uart + spi_pull)");
+    RTL_INFO(Serial, "[RTL] Runtime: tasks started OK (ws_uart + spi_pull)\n");
   } else {
     g_tasksEnabledRuntime = false;
-    RTL_PRINTF(Serial, "[RTL] Runtime: task create FAILED (ws_uart=%d spi_pull=%d) -> falling back to loop()\n",
+    RTL_INFO(Serial, "[RTL] Runtime: task create FAILED (ws_uart=%d spi_pull=%d) -> falling back to loop()\n",
                   (int)okA, (int)okB);
   }
 }

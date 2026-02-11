@@ -19,10 +19,13 @@ struct DcmSpiHdr {
 };
 #pragma pack(pop)
 
-static constexpr uint8_t SPI_TYPE_IDLE = 0;
-static constexpr uint8_t SPI_TYPE_JPEG = 1;
-static constexpr uint8_t SPI_FLAG_START = 0x01;
-static constexpr uint8_t SPI_FLAG_END   = 0x02;
+static constexpr uint8_t SPI_TYPE_IDLE     = 0;
+static constexpr uint8_t SPI_TYPE_JPEG     = 1;
+static constexpr uint8_t SPI_TYPE_OTA      = 2;  // v0.1.9: RTL→S3 OTA data
+static constexpr uint8_t SPI_TYPE_OTA_ACK  = 3;  // v0.1.9: S3→RTL OTA ack
+static constexpr uint8_t SPI_FLAG_START    = 0x01;
+static constexpr uint8_t SPI_FLAG_END      = 0x02;
+static constexpr uint8_t SPI_FLAG_OTA_ERR  = 0x04;  // v0.1.9: S3 OTA error
 
 static inline uint16_t crc16Ccitt(const uint8_t* data, size_t len) {
   uint16_t crc = 0x0000; // XModem/CCITT initial value

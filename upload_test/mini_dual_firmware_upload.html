@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepCo Dual — OTA Firmware Upload</title>
+<!-- ═══ Version: 반드시 config.h CFG_FW_VERSION / GitHub 태그와 일치시킬 것 ═══ -->
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242836;
+    --border: #2e3348;
+    --text: #e4e6f0;
+    --text-dim: #8890a8;
+    --accent: #5b8af5;
+    --accent-hover: #7ba3ff;
+    --green: #3dd68c;
+    --red: #f5555d;
+    --orange: #f0a030;
+    --yellow: #f0d040;
+    --radius: 10px;
+    --font: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px;
+  }
+  h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    margin-bottom: 24px;
+  }
+  .container {
+    width: 100%;
+    max-width: 700px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* ─── Card ─── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+  .card-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 14px;
+  }
+
+  /* ─── Connection ─── */
+  .conn-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .conn-row label { font-size: 0.85rem; color: var(--text-dim); }
+  .conn-row input[type="text"] {
+    flex: 1;
+    min-width: 140px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: var(--text);
+    font-size: 0.9rem;
+    font-family: var(--mono);
+    outline: none;
+  }
+  .conn-row input:focus { border-color: var(--accent); }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 18px;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+    font-family: var(--font);
+  }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-danger:hover:not(:disabled) { background: #ff6b73; }
+  .btn-success { background: var(--green); color: #111; }
+  .btn-success:hover:not(:disabled) { background: #50e89e; }
+  .btn-outline {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  .btn-outline:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+
+  .status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--red);
+    flex-shrink: 0;
+  }
+  .status-dot.connected { background: var(--green); }
+  .status-dot.connecting { background: var(--orange); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
+  .status-text { font-size: 0.8rem; color: var(--text-dim); }
+
+  /* ─── Target Tabs ─── */
+  .tab-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 14px;
+  }
+  .tab-btn {
+    flex: 1;
+    padding: 10px;
+    background: var(--surface2);
+    border: 2px solid transparent;
+    border-radius: 8px;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: center;
+    transition: all 0.15s;
+  }
+  .tab-btn:hover { border-color: var(--border); color: var(--text); }
+  .tab-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(91,138,245,0.08); }
+  .tab-btn .chip-name { display: block; font-size: 1rem; margin-bottom: 2px; }
+  .tab-btn .chip-desc { font-size: 0.7rem; font-weight: 400; }
+
+  /* ─── File ─── */
+  .file-zone {
+    border: 2px dashed var(--border);
+    border-radius: 8px;
+    padding: 28px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    position: relative;
+  }
+  .file-zone:hover, .file-zone.dragover {
+    border-color: var(--accent);
+    background: rgba(91,138,245,0.04);
+  }
+  .file-zone input[type="file"] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer;
+  }
+  .file-zone .icon { font-size: 2rem; margin-bottom: 6px; }
+  .file-zone .label { font-size: 0.85rem; color: var(--text-dim); }
+  .file-zone .label b { color: var(--accent); }
+
+  .file-info {
+    display: none;
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: var(--surface2);
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font-family: var(--mono);
+  }
+  .file-info.show { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .file-info .fname { color: var(--accent); }
+  .file-info .fsize { color: var(--text-dim); }
+  .file-info .fvalid { color: var(--green); }
+  .file-info .finvalid { color: var(--red); }
+
+  /* ─── Progress ─── */
+  .progress-wrap {
+    display: none;
+    margin-top: 14px;
+  }
+  .progress-wrap.show { display: block; }
+  .progress-bar-bg {
+    width: 100%;
+    height: 22px;
+    background: var(--surface2);
+    border-radius: 11px;
+    overflow: hidden;
+    position: relative;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--green));
+    border-radius: 11px;
+    width: 0%;
+    transition: width 0.2s;
+  }
+  .progress-bar-fill.error { background: linear-gradient(90deg, var(--red), var(--orange)); }
+  .progress-text {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #fff;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  }
+  .upload-stats {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    margin-top: 6px;
+  }
+
+  /* ─── Action ─── */
+  .action-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  /* ─── Log ─── */
+  .log-area {
+    background: #0a0c12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    max-height: 260px;
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    line-height: 1.6;
+    color: var(--text-dim);
+  }
+  .log-area::-webkit-scrollbar { width: 6px; }
+  .log-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line.info { color: var(--accent); }
+  .log-line.ok { color: var(--green); }
+  .log-line.warn { color: var(--orange); }
+  .log-line.err { color: var(--red); }
+  .log-line .ts { color: #555; margin-right: 6px; }
+
+  /* ─── Reboot countdown ─── */
+  .reboot-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 100;
+    justify-content: center;
+    align-items: center;
+  }
+  .reboot-overlay.show { display: flex; }
+  .reboot-box {
+    background: var(--surface);
+    border: 1px solid var(--green);
+    border-radius: 14px;
+    padding: 36px 48px;
+    text-align: center;
+  }
+  .reboot-box .icon { font-size: 3rem; margin-bottom: 12px; }
+  .reboot-box h2 { font-size: 1.2rem; margin-bottom: 8px; }
+  .reboot-box p { color: var(--text-dim); font-size: 0.9rem; }
+  .reboot-box .countdown { font-size: 2rem; font-weight: 700; color: var(--accent); margin-top: 12px; }
+
+  /* ─── Footer ─── */
+  .footer {
+    margin-top: 24px;
+    font-size: 0.7rem;
+    color: #444;
+    text-align: center;
+  }
+
+  /* Responsive */
+  @media (max-width: 520px) {
+    body { padding: 12px 8px; }
+    .tab-btn .chip-name { font-size: 0.85rem; }
+  }
+</style>
+</head>
+<body>
+
+<h1>DeepCo Dual — OTA Firmware Upload</h1>
+<p class="subtitle">RTL8720DN + ESP32-S3 무선 펌웨어 업데이트 테스트</p>
+
+<div class="container">
+
+  <!-- ═══ Connection ═══ -->
+  <div class="card">
+    <div class="card-title">1. 로봇 연결</div>
+    <div class="conn-row">
+      <label>IP:</label>
+      <input type="text" id="robotIp" value="192.168.4.1" placeholder="192.168.4.1">
+      <button class="btn btn-primary" id="btnConnect" onclick="toggleConnect()">연결</button>
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-text" id="statusText">미연결</span>
+    </div>
+    <div style="margin-top:10px; font-size:0.75rem; color:var(--text-dim)">
+      로봇 Wi-Fi (<code>DCM-XXXXXXXX</code>) 에 먼저 연결한 후 사용하세요.
+      WebSocket <code>ws://IP/ws</code> 로 연결합니다.
+    </div>
+  </div>
+
+  <!-- ═══ Target ═══ -->
+  <div class="card">
+    <div class="card-title">2. 대상 칩 선택</div>
+    <div class="tab-row">
+      <button class="tab-btn active" id="tabRtl" onclick="selectTarget('rtl')">
+        <span class="chip-name">RTL8720DN</span>
+        <span class="chip-desc">Wi-Fi 브릿지 (max ~1MB)</span>
+      </button>
+      <button class="tab-btn" id="tabS3" onclick="selectTarget('s3')">
+        <span class="chip-name">ESP32-S3</span>
+        <span class="chip-desc">로봇 제어 (max ~1.87MB)</span>
+      </button>
+    </div>
+
+    <!-- ═══ File ═══ -->
+    <div class="card-title" style="margin-top:4px">3. 펌웨어 파일 선택</div>
+    <div class="file-zone" id="fileZone">
+      <input type="file" id="fileInput" accept=".bin" onchange="handleFile(this.files[0])">
+      <div class="icon">📁</div>
+      <div class="label"><b>.bin</b> 파일을 드래그하거나 클릭하여 선택</div>
+    </div>
+    <div class="file-info" id="fileInfo">
+      <span class="fname" id="fileName">—</span>
+      <span class="fsize" id="fileSize">—</span>
+      <span id="fileValid"></span>
+    </div>
+
+    <!-- ═══ Progress ═══ -->
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progressFill"></div>
+        <div class="progress-text" id="progressText">0%</div>
+      </div>
+      <div class="upload-stats">
+        <span id="statSent">0 / 0 KB</span>
+        <span id="statSpeed">— KB/s</span>
+        <span id="statEta">—</span>
+      </div>
+    </div>
+
+    <!-- ═══ Actions ═══ -->
+    <div class="action-row">
+      <button class="btn btn-success" id="btnUpload" onclick="startUpload()" disabled>
+        업로드 시작
+      </button>
+      <button class="btn btn-danger" id="btnCancel" onclick="cancelUpload()" disabled>
+        취소
+      </button>
+      <button class="btn btn-outline" id="btnDiag" onclick="sendDiag()">
+        @diag
+      </button>
+    </div>
+  </div>
+
+  <!-- ═══ Log ═══ -->
+  <div class="card">
+    <div class="card-title" style="display:flex; justify-content:space-between; align-items:center">
+      <span>로그</span>
+      <button class="btn btn-outline" style="padding:4px 10px; font-size:0.7rem" onclick="clearLog()">지우기</button>
+    </div>
+    <div class="log-area" id="logArea"></div>
+  </div>
+
+</div>
+
+<!-- ═══ Reboot Overlay ═══ -->
+<div class="reboot-overlay" id="rebootOverlay">
+  <div class="reboot-box">
+    <div class="icon">🔄</div>
+    <h2>펌웨어 업데이트 완료</h2>
+    <p>로봇이 재부팅 중입니다. 잠시 기다려주세요.</p>
+    <div class="countdown" id="rebootCountdown">10</div>
+  </div>
+</div>
+
+<div class="footer">
+  DeepCo_Dual v0.1.9 &nbsp;|&nbsp; OTA Firmware Upload Test
+</div>
+
+<script>
+// ════════════════════════════════════════════
+// State
+// ════════════════════════════════════════════
+let ws = null;
+let target = 'rtl';          // 'rtl' | 's3'
+let selectedFile = null;
+let uploading = false;
+let uploadAborted = false;
+
+// OTA protocol constants
+const CHUNK_SIZE = 4096;      // 4KB per chunk
+const RTL_MAX_SIZE = 1 * 1024 * 1024;      // 1MB
+const S3_MAX_SIZE  = 1.875 * 1024 * 1024;  // ~1.87MB (partition size)
+
+// ESP32 .bin magic byte
+const ESP32_MAGIC = 0xE9;
+// RTL8720DN (AmebaD) .bin has no universal magic — skip for now
+
+// ════════════════════════════════════════════
+// Logging
+// ════════════════════════════════════════════
+function log(msg, cls = '') {
+  const el = document.getElementById('logArea');
+  const ts = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+  const line = document.createElement('div');
+  line.className = 'log-line ' + cls;
+  line.innerHTML = `<span class="ts">[${ts}]</span>${escHtml(msg)}`;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function clearLog() {
+  document.getElementById('logArea').innerHTML = '';
+}
+
+// ════════════════════════════════════════════
+// WebSocket Connection
+// ════════════════════════════════════════════
+function toggleConnect() {
+  if (ws && ws.readyState <= 1) {
+    ws.close();
+    return;
+  }
+  connect();
+}
+
+function connect() {
+  const ip = document.getElementById('robotIp').value.trim();
+  if (!ip) { log('IP 주소를 입력하세요', 'warn'); return; }
+
+  setConnState('connecting');
+  log(`ws://${ip}/ws 연결 시도...`, 'info');
+
+  try {
+    ws = new WebSocket(`ws://${ip}/ws`);
+  } catch (e) {
+    log('WebSocket 생성 실패: ' + e.message, 'err');
+    setConnState('disconnected');
+    return;
+  }
+
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    setConnState('connected');
+    log('WebSocket 연결 성공', 'ok');
+  };
+
+  ws.onclose = (e) => {
+    setConnState('disconnected');
+    log(`연결 종료 (code=${e.code}, reason=${e.reason || 'N/A'})`, 'warn');
+    ws = null;
+  };
+
+  ws.onerror = () => {
+    log('WebSocket 에러 발생', 'err');
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      handleTextMessage(ev.data);
+    } else {
+      // binary — ignore for now (camera frames come on port 81)
+    }
+  };
+}
+
+function setConnState(state) {
+  const dot = document.getElementById('statusDot');
+  const txt = document.getElementById('statusText');
+  const btn = document.getElementById('btnConnect');
+
+  dot.className = 'status-dot ' + (state === 'connected' ? 'connected' : state === 'connecting' ? 'connecting' : '');
+  txt.textContent = state === 'connected' ? '연결됨' : state === 'connecting' ? '연결 중...' : '미연결';
+  btn.textContent = state === 'connected' ? '연결 해제' : '연결';
+  btn.className = 'btn ' + (state === 'connected' ? 'btn-danger' : 'btn-primary');
+
+  updateUploadBtnState();
+}
+
+function handleTextMessage(data) {
+  // OTA-specific responses
+  if (data.startsWith('@ota,')) {
+    handleOtaResponse(data);
+    return;
+  }
+  // @diag response: RTL sends "@diag,{...json...}"
+  if (data.startsWith('@diag,{')) {
+    try {
+      const json = data.substring(6); // skip "@diag,"
+      const d = JSON.parse(json);
+      log(`@diag: uptime=${d.uptime_sec}s ch=${d.ap_channel} sta=${d.sta_count} ws_ctrl=${d.ws_ctrl}`, 'info');
+      if (d.fw_version) log(`  fw_version: ${d.fw_version}`, 'ok');
+      if (d.ota_active) log(`  OTA: active`, 'warn');
+    } catch (e) {
+      log('RECV: ' + data);
+    }
+    return;
+  }
+  log('RECV: ' + data);
+}
+
+function handleOtaResponse(data) {
+  const parts = data.split(',');
+  const cmd = parts[1];
+
+  if (cmd === 'ready') {
+    log('RTL OTA 준비 완료, 펌웨어 전송 시작...', 'ok');
+    sendFirmwareChunks();
+  } else if (cmd === 'ack') {
+    // chunk acknowledged
+    const offset = parseInt(parts[2] || '0');
+    updateProgress(offset);
+  } else if (cmd === 'done') {
+    log('OTA 기록 완료. 재부팅 대기...', 'ok');
+    finishUpload(true);
+  } else if (cmd === 'error') {
+    const reason = parts.slice(2).join(',');
+    log('OTA 에러: ' + reason, 'err');
+    finishUpload(false);
+  } else if (cmd === 'progress') {
+    const pct = parseInt(parts[2] || '0');
+    log(`S3 OTA 진행: ${pct}%`, 'info');
+  } else {
+    log('OTA: ' + data, 'info');
+  }
+}
+
+// ════════════════════════════════════════════
+// Target Selection
+// ════════════════════════════════════════════
+function selectTarget(t) {
+  target = t;
+  document.getElementById('tabRtl').className = 'tab-btn' + (t === 'rtl' ? ' active' : '');
+  document.getElementById('tabS3').className = 'tab-btn' + (t === 's3' ? ' active' : '');
+  // re-validate file if selected
+  if (selectedFile) validateFile(selectedFile);
+  log(`대상: ${t === 'rtl' ? 'RTL8720DN' : 'ESP32-S3'}`, 'info');
+}
+
+// ════════════════════════════════════════════
+// File Handling
+// ════════════════════════════════════════════
+const fileZone = document.getElementById('fileZone');
+fileZone.addEventListener('dragover', (e) => { e.preventDefault(); fileZone.classList.add('dragover'); });
+fileZone.addEventListener('dragleave', () => fileZone.classList.remove('dragover'));
+fileZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  fileZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+
+function handleFile(file) {
+  if (!file) return;
+  selectedFile = file;
+
+  document.getElementById('fileName').textContent = file.name;
+  document.getElementById('fileSize').textContent = formatSize(file.size);
+  document.getElementById('fileInfo').className = 'file-info show';
+
+  validateFile(file);
+}
+
+async function validateFile(file) {
+  const validEl = document.getElementById('fileValid');
+  const maxSize = target === 'rtl' ? RTL_MAX_SIZE : S3_MAX_SIZE;
+  const errors = [];
+
+  // extension check
+  if (!file.name.toLowerCase().endsWith('.bin')) {
+    errors.push('.bin 파일만 지원');
+  }
+
+  // size check
+  if (file.size === 0) {
+    errors.push('빈 파일');
+  } else if (file.size > maxSize) {
+    errors.push(`크기 초과 (max ${formatSize(maxSize)})`);
+  }
+
+  // magic byte check (S3 only)
+  if (target === 's3' && file.size > 0) {
+    const header = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    if (header[0] !== ESP32_MAGIC) {
+      errors.push(`ESP32 매직바이트 불일치 (0x${header[0].toString(16).toUpperCase()}, 기대: 0xE9)`);
+    }
+  }
+
+  if (errors.length === 0) {
+    validEl.className = 'fvalid';
+    validEl.textContent = '✓ 유효';
+    log(`파일 선택: ${file.name} (${formatSize(file.size)}) → ${target.toUpperCase()} 유효`, 'ok');
+  } else {
+    validEl.className = 'finvalid';
+    validEl.textContent = '✗ ' + errors.join(', ');
+    log(`파일 검증 실패: ${errors.join(', ')}`, 'err');
+  }
+
+  updateUploadBtnState();
+}
+
+function updateUploadBtnState() {
+  const connected = ws && ws.readyState === WebSocket.OPEN;
+  const valid = selectedFile &&
+                document.getElementById('fileValid').classList.contains('fvalid') &&
+                connected &&
+                !uploading;
+  document.getElementById('btnUpload').disabled = !valid;
+}
+
+// ════════════════════════════════════════════
+// Upload — WebSocket OTA
+// ════════════════════════════════════════════
+function startUpload() {
+  if (!selectedFile || uploading) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log('WebSocket 미연결 — 먼저 로봇에 연결하세요', 'err');
+    return;
+  }
+
+  uploading = true;
+  uploadAborted = false;
+  document.getElementById('btnUpload').disabled = true;
+  document.getElementById('btnCancel').disabled = false;
+  showProgress(true);
+
+  log(`=== OTA 업로드 시작 (WebSocket) ===`, 'info');
+  log(`대상: ${target.toUpperCase()}, 파일: ${selectedFile.name}, 크기: ${formatSize(selectedFile.size)}`, 'info');
+
+  uploadWs();
+}
+async function uploadWs() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log('WebSocket 미연결 — 먼저 로봇에 연결하세요', 'err');
+    finishUpload(false);
+    return;
+  }
+
+  log('WebSocket OTA: @ota,start 전송...', 'info');
+
+  // 1) Send start command
+  const startCmd = `@ota,start,${target},${selectedFile.size}`;
+  ws.send(startCmd);
+  log(`SEND: ${startCmd}`, 'info');
+
+  // Wait for @ota,ready from RTL (handled in onmessage → handleOtaResponse)
+  // If no firmware-side support, we start sending after a short timeout
+  log('RTL @ota,ready 응답 대기 중... (미구현 시 5초 후 자동 시작)', 'warn');
+
+  window._wsUploadTimeout = setTimeout(() => {
+    if (uploading && !uploadAborted) {
+      log('응답 없음 — RTL에 WS OTA 핸들러가 없습니다.', 'err');
+      log('→ Phase 2 구현 필요: RTL에 @ota 명령 핸들러 추가', 'warn');
+      finishUpload(false);
+    }
+  }, 5000);
+}
+
+async function sendFirmwareChunks() {
+  if (window._wsUploadTimeout) {
+    clearTimeout(window._wsUploadTimeout);
+    window._wsUploadTimeout = null;
+  }
+
+  const data = new Uint8Array(await selectedFile.arrayBuffer());
+  const total = data.length;
+  let offset = 0;
+  const startTime = Date.now();
+
+  while (offset < total && !uploadAborted) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      log('WebSocket 연결 끊김', 'err');
+      finishUpload(false);
+      return;
+    }
+
+    const end = Math.min(offset + CHUNK_SIZE, total);
+    const chunk = data.slice(offset, end);
+
+    // Send binary chunk with 8-byte header: [offset(4BE) + length(4BE) + payload]
+    const pkt = new ArrayBuffer(8 + chunk.length);
+    const view = new DataView(pkt);
+    view.setUint32(0, offset, false);       // offset (big-endian)
+    view.setUint32(4, chunk.length, false);  // length (big-endian)
+    new Uint8Array(pkt, 8).set(chunk);
+
+    ws.send(pkt);
+    offset = end;
+
+    // Update progress
+    const pct = Math.round((offset / total) * 100);
+    const elapsed = (Date.now() - startTime) / 1000;
+    const speed = offset / elapsed;
+    const remaining = (total - offset) / speed;
+
+    setProgress(pct);
+    document.getElementById('statSent').textContent = `${formatSize(offset)} / ${formatSize(total)}`;
+    document.getElementById('statSpeed').textContent = formatSize(speed) + '/s';
+    document.getElementById('statEta').textContent = remaining > 0 ? `~${Math.ceil(remaining)}초 남음` : '완료 중...';
+
+    // Small delay to avoid flooding
+    await sleep(10);
+  }
+
+  if (!uploadAborted) {
+    // Send end command with CRC (placeholder: size as checksum)
+    const endCmd = `@ota,end,${total}`;
+    ws.send(endCmd);
+    log(`SEND: ${endCmd}`, 'info');
+    log('펌웨어 전송 완료, RTL 확인 대기...', 'info');
+  }
+}
+
+// ════════════════════════════════════════════
+// Upload control
+// ════════════════════════════════════════════
+function cancelUpload() {
+  uploadAborted = true;
+  if (window._wsUploadTimeout) {
+    clearTimeout(window._wsUploadTimeout);
+    window._wsUploadTimeout = null;
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send('@ota,cancel');
+    log('SEND: @ota,cancel', 'info');
+  }
+  log('업로드 취소 요청', 'warn');
+  finishUpload(false);
+}
+
+function finishUpload(success) {
+  uploading = false;
+  document.getElementById('btnCancel').disabled = true;
+  updateUploadBtnState();
+
+  if (success) {
+    setProgress(100);
+    const fill = document.getElementById('progressFill');
+    fill.style.background = 'linear-gradient(90deg, var(--green), #50e89e)';
+    log('=== OTA 업로드 성공 ===', 'ok');
+    showRebootCountdown();
+  } else {
+    const fill = document.getElementById('progressFill');
+    fill.classList.add('error');
+    log('=== OTA 업로드 실패 또는 취소 ===', 'err');
+  }
+}
+
+// ════════════════════════════════════════════
+// Progress UI
+// ════════════════════════════════════════════
+function showProgress(show) {
+  document.getElementById('progressWrap').className = 'progress-wrap' + (show ? ' show' : '');
+  if (show) {
+    setProgress(0);
+    const fill = document.getElementById('progressFill');
+    fill.classList.remove('error');
+    fill.style.background = '';
+    document.getElementById('statSent').textContent = '0 / 0 KB';
+    document.getElementById('statSpeed').textContent = '— KB/s';
+    document.getElementById('statEta').textContent = '—';
+  }
+}
+
+function setProgress(pct) {
+  document.getElementById('progressFill').style.width = pct + '%';
+  document.getElementById('progressText').textContent = pct + '%';
+}
+
+function updateProgress(offset) {
+  if (!selectedFile) return;
+  const pct = Math.round((offset / selectedFile.size) * 100);
+  setProgress(pct);
+}
+
+// ════════════════════════════════════════════
+// Reboot countdown
+// ════════════════════════════════════════════
+function showRebootCountdown() {
+  const overlay = document.getElementById('rebootOverlay');
+  const countEl = document.getElementById('rebootCountdown');
+  overlay.className = 'reboot-overlay show';
+  let sec = 10;
+  countEl.textContent = sec;
+  const iv = setInterval(() => {
+    sec--;
+    countEl.textContent = sec;
+    if (sec <= 0) {
+      clearInterval(iv);
+      overlay.className = 'reboot-overlay';
+      log('재부팅 완료 예상. 다시 연결하세요.', 'info');
+      // attempt reconnect
+      setTimeout(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          log('자동 재연결 시도...', 'info');
+          connect();
+        }
+      }, 2000);
+    }
+  }, 1000);
+}
+
+// ════════════════════════════════════════════
+// Diagnostics
+// ════════════════════════════════════════════
+function sendDiag() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log('WebSocket 미연결', 'warn');
+    return;
+  }
+  ws.send('@diag');
+  log('SEND: @diag', 'info');
+}
+
+// ════════════════════════════════════════════
+// Utilities
+// ════════════════════════════════════════════
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ════════════════════════════════════════════
+// Init
+// ════════════════════════════════════════════
+log('DeepCo Dual OTA 테스트 페이지 로드 완료', 'info');
+log('Phase 1: 프론트엔드 UI 테스트 (펌웨어 OTA 핸들러는 Phase 2에서 구현)', 'warn');
+log('현재 테스트 가능 항목:', 'info');
+log('  - WebSocket 연결 (ws://IP/ws)', 'info');
+log('  - @diag 명령 전송/수신', 'info');
+log('  - .bin 파일 선택 및 유효성 검사', 'info');
+log('  - WS OTA 업로드 시도 (RTL @ota 핸들러 미구현 시 타임아웃)', 'info');
+log('OTA 프로토콜: @ota,start → binary chunks (4KB) → @ota,end', 'info');
+</script>
+
+</body>
+</html>

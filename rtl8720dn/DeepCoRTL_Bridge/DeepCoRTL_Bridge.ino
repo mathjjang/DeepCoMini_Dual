@@ -1,5 +1,6 @@
 /*
   DeepCoRTL_Bridge.ino (RTL8720DN / BW16 등, Arduino IDE)
+  FW Version: 0.1.9  (config.h CFG_FW_VERSION 과 일치시킬 것)
 
   목표:
   - RTL8720DN이 Wi‑Fi AP + WebSocket 서버를 제공 (로봇 IP = 192.168.4.1)
@@ -32,9 +33,11 @@
 #endif
 #include "src/dc_ws/WebSocketsServer.h" // project-local copy (no global library patch)
 
-// Realtek/Ameba low-level Wi-Fi API (AP client list)
+// Realtek/Ameba low-level Wi-Fi API (AP client list) + Flash OTA API
 extern "C" {
   #include "wifi_conf.h"
+  #include "flash_api.h"
+  #include "sys_api.h"
 }
 
 // -------------------------------------------------------
@@ -116,6 +119,9 @@ static constexpr int SPI_SS_PIN = CFG_SPI_SS_PIN;
 static constexpr uint32_t SPI_HZ = CFG_SPI_HZ;
 static constexpr size_t SPI_BLOCK_BYTES = CFG_SPI_BLOCK_BYTES;
 
+// SPI RX/TX 버퍼 — 카메라 수신 및 S3 OTA 전송 공용
+static uint8_t g_spiRx[SPI_BLOCK_BYTES];
+
 #define ENABLE_CAMERA_BRIDGE CFG_ENABLE_CAMERA_BRIDGE
 
 // 설계 방침(사용자 요청):
@@ -161,6 +167,467 @@ static bool isValidChannel(int ch) {
 static void sendSafetyStopToS3() {
   // DeepcoMini v1.3 커맨드 규약 그대로
   Serial1.println("stop,100");
+}
+
+// -----------------------------
+// WebSocket servers — OTA/카메라 등 전역에서 사용하므로 선행 선언
+// (Links2004/arduinoWebSockets)
+// -----------------------------
+WebSocketsServer wsControl(CFG_WS_CONTROL_PORT);
+static volatile bool hasControlClient = false;
+static volatile uint8_t g_controlClientNum = 0xFF;
+
+#if ENABLE_CAMERA_BRIDGE
+WebSocketsServer wsCamera(CFG_WS_CAMERA_PORT);
+static volatile bool hasCameraClient = false;
+static volatile uint8_t g_cameraClientNum = 0xFF;
+#endif
+
+static inline bool controlClientConnected() {
+  return hasControlClient && g_controlClientNum != 0xFF && wsControl.clientIsConnected(g_controlClientNum);
+}
+
+#if ENABLE_CAMERA_BRIDGE
+static inline bool cameraClientConnected() {
+  return hasCameraClient && g_cameraClientNum != 0xFF && wsCamera.clientIsConnected(g_cameraClientNum);
+}
+#endif
+
+// =============================================================
+// v0.1.9: WebSocket OTA 펌웨어 업데이트
+//
+// 프로토콜 (HTML ↔ RTL):
+//   1. HTML → RTL:  "@ota,start,rtl,<size>"  (WS text)
+//   2. RTL → HTML:  "@ota,ready"             (WS text)
+//   3. HTML → RTL:  binary chunks [offset(4BE)+len(4BE)+payload]
+//   4. HTML → RTL:  "@ota,end,<total_size>"  (WS text)
+//   5. RTL → HTML:  "@ota,done"              (WS text) → reboot
+//
+// Flash layout (AmebaD):
+//   OTA_ADDR_1 = 0x006000  (first upload via serial)
+//   OTA_ADDR_2 = 0x106000  (bootloader checks this first)
+//   Max image = 1MB (0x100000)
+// =============================================================
+#define OTA_ADDR_1        0x006000
+#define OTA_ADDR_2        0x106000
+#define OTA_SIG_VALID     0x35393138   // bootloader "valid" signature word 1
+#define OTA_SIG_VALID2    0x31313738   // bootloader "valid" signature word 2
+#define OTA_SIG_INVALID   0x35393130   // anything != VALID
+#define OTA_SECTOR_SZ     4096
+#define OTA_MAX_IMAGE_SZ  (OTA_ADDR_2 - OTA_ADDR_1)  // 1MB
+
+static struct {
+  bool     active;             // OTA 진행 중 플래그
+  bool     s3Mode;             // true = S3 경유 OTA (Phase 3, 미구현)
+  uint32_t expectedSize;       // 예상 이미지 크기
+  uint32_t received;           // 수신된 바이트 수
+  uint32_t addrNew;            // 쓸 OTA 주소
+  uint32_t addrOld;            // 기존 OTA 주소 (무효화 대상)
+  flash_t  flash;              // Flash API 핸들
+  uint32_t checksum;           // 바이트 합산 체크섬
+  uint32_t startMs;            // 시작 시각
+} g_ota = {};
+
+// OTA: 대상 주소 결정 (부트로더는 ADDR_2를 먼저 확인)
+static bool otaChooseAddress() {
+  uint32_t sig1 = 0xFFFFFFFF, sig2 = 0xFFFFFFFF;
+  flash_read_word(&g_ota.flash, OTA_ADDR_1, &sig1);
+  flash_read_word(&g_ota.flash, OTA_ADDR_2, &sig2);
+
+  if (sig2 == OTA_SIG_VALID) {
+    // ADDR_2가 현재 부팅 중 → ADDR_1에 새 이미지 기록
+    g_ota.addrNew = OTA_ADDR_1;
+    g_ota.addrOld = OTA_ADDR_2;
+  } else if (sig1 == OTA_SIG_VALID) {
+    // ADDR_1이 현재 부팅 중 → ADDR_2에 새 이미지 기록
+    g_ota.addrNew = OTA_ADDR_2;
+    g_ota.addrOld = OTA_ADDR_1;
+  } else {
+    Serial.println("[OTA] ERR: no valid image found in flash");
+    return false;
+  }
+  RTL_PRINTF(Serial, "[OTA] target=0x%06X, current=0x%06X\n",
+             (unsigned)g_ota.addrNew, (unsigned)g_ota.addrOld);
+  return true;
+}
+
+// OTA: Flash 섹터 삭제 (이미지 크기만큼)
+static bool otaEraseFlash(uint32_t imageSize) {
+  const uint32_t sectors = (imageSize + OTA_SECTOR_SZ - 1) / OTA_SECTOR_SZ;
+  RTL_PRINTF(Serial, "[OTA] erasing %lu sectors (%lu bytes)...\n",
+             (unsigned long)sectors, (unsigned long)imageSize);
+  for (uint32_t i = 0; i < sectors; i++) {
+    flash_erase_sector(&g_ota.flash, g_ota.addrNew + i * OTA_SECTOR_SZ);
+  }
+  Serial.println("[OTA] erase done");
+  return true;
+}
+
+// OTA 시작: @ota,start,rtl,<size>
+static void otaBegin(uint32_t imageSize) {
+  if (g_ota.active) {
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,already_active");
+    return;
+  }
+  if (imageSize == 0 || imageSize > OTA_MAX_IMAGE_SZ) {
+    char err[64];
+    snprintf(err, sizeof(err), "@ota,error,invalid_size_%lu_max_%lu",
+             (unsigned long)imageSize, (unsigned long)OTA_MAX_IMAGE_SZ);
+    if (controlClientConnected()) wsControl.sendTXT(g_controlClientNum, err);
+    return;
+  }
+
+  // Flash 주소 결정
+  if (!otaChooseAddress()) {
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,flash_address_fail");
+    return;
+  }
+
+  // Flash 삭제
+  if (!otaEraseFlash(imageSize)) {
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,flash_erase_fail");
+    return;
+  }
+
+  // 모터 안전 정지 + 카메라 비활성화
+  sendSafetyStopToS3();
+  Serial1.println("@cam,0");
+
+  g_ota.active = true;
+  g_ota.s3Mode = false;
+  g_ota.expectedSize = imageSize;
+  g_ota.received = 0;
+  g_ota.checksum = 0;
+  g_ota.startMs = millis();
+
+  RTL_PRINTF(Serial, "[OTA] started: size=%lu\n", (unsigned long)imageSize);
+  if (controlClientConnected())
+    wsControl.sendTXT(g_controlClientNum, "@ota,ready");
+}
+
+// OTA 청크 수신: WS binary [offset(4BE) + length(4BE) + payload]
+static void otaWriteChunk(const uint8_t* data, size_t len) {
+  if (!g_ota.active || len < 8) return;
+
+  // 헤더 파싱 (big-endian)
+  const uint32_t offset = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                           ((uint32_t)data[2] << 8)  | (uint32_t)data[3];
+  const uint32_t chunkLen = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
+                             ((uint32_t)data[6] << 8)  | (uint32_t)data[7];
+  const uint8_t* payload = data + 8;
+  const size_t payloadLen = len - 8;
+
+  if (chunkLen != payloadLen || (offset + chunkLen) > g_ota.expectedSize) {
+    RTL_PRINTF(Serial, "[OTA] ERR: bad chunk off=%lu len=%lu payload=%lu\n",
+               (unsigned long)offset, (unsigned long)chunkLen, (unsigned long)payloadLen);
+    return;
+  }
+
+  // Flash 기록
+  if (flash_stream_write(&g_ota.flash, g_ota.addrNew + offset, chunkLen, (uint8_t*)payload) < 0) {
+    Serial.println("[OTA] ERR: flash write fail");
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,flash_write_fail");
+    g_ota.active = false;
+    return;
+  }
+
+  // 체크섬 누적
+  for (size_t i = 0; i < chunkLen; i++) {
+    g_ota.checksum += payload[i];
+  }
+  g_ota.received += chunkLen;
+}
+
+// OTA 완료: @ota,end,<total_size>
+static void otaEnd(uint32_t reportedSize) {
+  if (!g_ota.active) return;
+
+  RTL_PRINTF(Serial, "[OTA] end: received=%lu, expected=%lu, reported=%lu\n",
+             (unsigned long)g_ota.received, (unsigned long)g_ota.expectedSize,
+             (unsigned long)reportedSize);
+
+  if (g_ota.received != g_ota.expectedSize || reportedSize != g_ota.expectedSize) {
+    Serial.println("[OTA] ERR: size mismatch");
+    // 실패: 새 이미지 무효화, 기존 복원
+    flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
+    flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
+    g_ota.active = false;
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,size_mismatch");
+    return;
+  }
+
+  // Flash에 기록된 데이터 체크섬 검증 (읽어서 비교)
+  uint32_t flashChecksum = 0;
+  uint8_t verifyBuf[512];
+  uint32_t pos = 0;
+  while (pos < g_ota.expectedSize) {
+    uint32_t readLen = (g_ota.expectedSize - pos > sizeof(verifyBuf))
+                       ? sizeof(verifyBuf) : (g_ota.expectedSize - pos);
+    flash_stream_read(&g_ota.flash, g_ota.addrNew + pos, readLen, verifyBuf);
+    for (uint32_t i = 0; i < readLen; i++) flashChecksum += verifyBuf[i];
+    pos += readLen;
+  }
+
+  if (flashChecksum != g_ota.checksum) {
+    RTL_PRINTF(Serial, "[OTA] ERR: checksum mismatch (ram=%08X flash=%08X)\n",
+               (unsigned)g_ota.checksum, (unsigned)flashChecksum);
+    flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
+    flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
+    g_ota.active = false;
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,checksum_mismatch");
+    return;
+  }
+
+  // 성공: 새 이미지 서명 기록 + 기존 이미지 무효화
+  flash_write_word(&g_ota.flash, g_ota.addrNew + 0, OTA_SIG_VALID);
+  flash_write_word(&g_ota.flash, g_ota.addrNew + 4, OTA_SIG_VALID2);
+
+  // 서명 검증
+  uint32_t s1 = 0, s2 = 0;
+  flash_read_word(&g_ota.flash, g_ota.addrNew + 0, &s1);
+  flash_read_word(&g_ota.flash, g_ota.addrNew + 4, &s2);
+  if (s1 != OTA_SIG_VALID || s2 != OTA_SIG_VALID2) {
+    Serial.println("[OTA] ERR: signature write failed");
+    g_ota.active = false;
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,signature_fail");
+    return;
+  }
+
+  // 기존 이미지 무효화
+  flash_write_word(&g_ota.flash, g_ota.addrOld + 0, OTA_SIG_INVALID);
+
+  const uint32_t elapsed = (millis() - g_ota.startMs) / 1000;
+  RTL_PRINTF(Serial, "[OTA] SUCCESS: %lu bytes in %lus, checksum=%08X\n",
+             (unsigned long)g_ota.received, (unsigned long)elapsed, (unsigned)g_ota.checksum);
+  g_ota.active = false;
+
+  if (controlClientConnected())
+    wsControl.sendTXT(g_controlClientNum, "@ota,done");
+
+  // 2초 후 재부팅 (WS 응답이 전송될 시간 확보)
+  delay(2000);
+  sys_reset();
+}
+
+// OTA 취소
+static void otaCancel() {
+  if (!g_ota.active) return;
+  Serial.println("[OTA] cancelled");
+  // 새 이미지 무효화, 기존 복원
+  flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
+  flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
+  g_ota.active = false;
+  // 카메라 복구
+  Serial1.println("@cam,1");
+  if (controlClientConnected())
+    wsControl.sendTXT(g_controlClientNum, "@ota,cancelled");
+}
+
+// =============================================================
+// v0.1.9: S3 SPI OTA — RTL이 WS binary를 받아 SPI로 S3에 전달
+//
+// RTL은 SPI Master. 평소 spiReadBlock()은 TX=0, RX=S3 카메라.
+// OTA 시: TX에 DcmSpiHdr(type=OTA)+payload 적재 → S3가 RX에서 수신.
+// S3 응답은 다음 전송의 RX에 돌아옴 (pipeline).
+// =============================================================
+static struct {
+  bool     active;
+  uint32_t expectedSize;
+  uint32_t sent;             // S3에 SPI로 전달한 바이트 수
+  uint16_t seq;              // SPI 블록 시퀀스
+  bool     s3Error;          // S3에서 에러 ACK 수신
+  uint32_t startMs;
+} g_otaS3 = {};
+
+// SPI 전송+수신 (in-place: block에 TX 데이터 → 전송 후 RX 데이터로 교체)
+static bool spiOtaTransfer(uint8_t* block, size_t len) {
+  SPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
+  SPI.transfer((byte)SPI_SS_PIN, block, len, SPI_LAST);
+  SPI.endTransaction();
+  return true;
+}
+
+// S3 응답 확인 (이전 전송의 결과가 block에 들어있음)
+// NOTE: hdrLooksOk 매크로가 후방 정의이므로 직접 매직 체크
+static bool spiCheckS3Ack(const uint8_t* block) {
+  const DcmSpiHdr* ack = (const DcmSpiHdr*)block;
+  if (ack->magic[0] != 'D' || ack->magic[1] != 'C' ||
+      ack->magic[2] != 'M' || ack->magic[3] != '2') return true; // S3 아직 응답 전 (idle) — OK
+  if (ack->type == SPI_TYPE_OTA_ACK) {
+    if (ack->flags & SPI_FLAG_OTA_ERR) {
+      Serial.println("[OTA-S3] S3 reported error");
+      return false;
+    }
+  }
+  return true;
+}
+
+// SPI OTA 블록 빌드 + 전송 (payload를 g_spiRx에 적재)
+static bool spiSendOtaBlock(const uint8_t* payload, size_t payloadLen,
+                            uint32_t offset, uint32_t totalSize, uint8_t flags) {
+  memset(g_spiRx, 0, SPI_BLOCK_BYTES);
+  DcmSpiHdr* hdr = (DcmSpiHdr*)g_spiRx;
+  hdr->magic[0] = 'D'; hdr->magic[1] = 'C'; hdr->magic[2] = 'M'; hdr->magic[3] = '2';
+  hdr->type = SPI_TYPE_OTA;
+  hdr->flags = flags;
+  hdr->seq = g_otaS3.seq++;
+  hdr->total_len = totalSize;
+  hdr->offset = offset;
+  hdr->payload_len = (uint16_t)payloadLen;
+  if (payloadLen > 0) {
+    memcpy(g_spiRx + sizeof(DcmSpiHdr), payload, payloadLen);
+    hdr->crc16 = crc16Ccitt(g_spiRx + sizeof(DcmSpiHdr), payloadLen);
+  } else {
+    hdr->crc16 = 0;
+  }
+
+  spiOtaTransfer(g_spiRx, SPI_BLOCK_BYTES);
+  // g_spiRx now contains S3's response (from PREVIOUS transfer)
+  return spiCheckS3Ack(g_spiRx);
+}
+
+// S3 OTA 시작
+static void otaS3Begin(uint32_t imageSize) {
+  if (g_ota.active || g_otaS3.active) {
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,already_active");
+    return;
+  }
+  if (imageSize == 0) {
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,invalid_size");
+    return;
+  }
+
+  // 모터 안전 정지 + 카메라 OFF
+  sendSafetyStopToS3();
+  Serial1.println("@cam,0");
+  delay(100); // S3가 카메라 끌 시간
+
+  g_otaS3.active = true;
+  g_otaS3.expectedSize = imageSize;
+  g_otaS3.sent = 0;
+  g_otaS3.seq = 1;
+  g_otaS3.s3Error = false;
+  g_otaS3.startMs = millis();
+
+  // 첫 SPI 블록: START flag + 페이로드 0 (S3에게 OTA 시작 알림)
+  RTL_PRINTF(Serial, "[OTA-S3] start: size=%lu\n", (unsigned long)imageSize);
+  if (!spiSendOtaBlock(nullptr, 0, 0, imageSize, SPI_FLAG_START)) {
+    g_otaS3.active = false;
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,s3_start_fail");
+    return;
+  }
+  delay(200); // S3 Update.begin() 대기
+
+  if (controlClientConnected())
+    wsControl.sendTXT(g_controlClientNum, "@ota,ready");
+}
+
+// S3 OTA 청크: WS binary → SPI 전달
+static void otaS3WriteChunk(const uint8_t* data, size_t len) {
+  if (!g_otaS3.active || len < 8) return;
+
+  // WS 헤더 파싱 (big-endian: offset + length)
+  const uint32_t wsOffset = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                             ((uint32_t)data[2] << 8)  | (uint32_t)data[3];
+  const uint32_t wsChunkLen = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
+                               ((uint32_t)data[6] << 8)  | (uint32_t)data[7];
+  const uint8_t* payload = data + 8;
+  const size_t payloadLen = len - 8;
+
+  if (wsChunkLen != payloadLen) return;
+
+  // SPI 블록 크기 제한으로 분할 전송
+  const size_t maxPayloadPerBlock = SPI_BLOCK_BYTES - sizeof(DcmSpiHdr);
+  size_t sent = 0;
+  while (sent < payloadLen) {
+    const size_t chunkSz = ((payloadLen - sent) > maxPayloadPerBlock)
+                           ? maxPayloadPerBlock : (payloadLen - sent);
+    const uint32_t blockOffset = wsOffset + sent;
+
+    if (!spiSendOtaBlock(payload + sent, chunkSz, blockOffset, g_otaS3.expectedSize, 0)) {
+      g_otaS3.s3Error = true;
+      g_otaS3.active = false;
+      if (controlClientConnected())
+        wsControl.sendTXT(g_controlClientNum, "@ota,error,s3_write_fail");
+      return;
+    }
+    sent += chunkSz;
+    delay(1); // SPI pacing — S3 Flash 기록 시간 확보
+  }
+  g_otaS3.sent += payloadLen;
+}
+
+// S3 OTA 완료
+static void otaS3End(uint32_t reportedSize) {
+  if (!g_otaS3.active) return;
+
+  RTL_PRINTF(Serial, "[OTA-S3] end: sent=%lu expected=%lu\n",
+             (unsigned long)g_otaS3.sent, (unsigned long)g_otaS3.expectedSize);
+
+  if (g_otaS3.sent != g_otaS3.expectedSize || reportedSize != g_otaS3.expectedSize) {
+    g_otaS3.active = false;
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,s3_size_mismatch");
+    return;
+  }
+
+  // END 블록 전송 (S3가 Update.end() 호출)
+  if (!spiSendOtaBlock(nullptr, 0, g_otaS3.sent, g_otaS3.expectedSize, SPI_FLAG_END)) {
+    g_otaS3.active = false;
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,s3_end_fail");
+    return;
+  }
+
+  // S3 응답 대기 (S3가 Update.end() + 검증하는 시간)
+  delay(2000);
+
+  // 마지막 SPI 전송으로 S3 최종 ACK 확인
+  memset(g_spiRx, 0, SPI_BLOCK_BYTES);
+  spiOtaTransfer(g_spiRx, SPI_BLOCK_BYTES);
+  const DcmSpiHdr* finalAck = (const DcmSpiHdr*)g_spiRx;
+
+  if (finalAck->magic[0] == 'D' && finalAck->magic[1] == 'C' &&
+      finalAck->magic[2] == 'M' && finalAck->magic[3] == '2' &&
+      finalAck->type == SPI_TYPE_OTA_ACK &&
+      (finalAck->flags & SPI_FLAG_OTA_ERR)) {
+    g_otaS3.active = false;
+    Serial.println("[OTA-S3] S3 reported final error");
+    if (controlClientConnected())
+      wsControl.sendTXT(g_controlClientNum, "@ota,error,s3_verify_fail");
+    return;
+  }
+
+  const uint32_t elapsed = (millis() - g_otaS3.startMs) / 1000;
+  RTL_PRINTF(Serial, "[OTA-S3] SUCCESS: %lu bytes in %lus\n",
+             (unsigned long)g_otaS3.sent, (unsigned long)elapsed);
+  g_otaS3.active = false;
+
+  if (controlClientConnected())
+    wsControl.sendTXT(g_controlClientNum, "@ota,done");
+  // S3는 자체적으로 ESP.restart() 호출
+}
+
+// S3 OTA 취소
+static void otaS3Cancel() {
+  if (!g_otaS3.active) return;
+  Serial.println("[OTA-S3] cancelled");
+  // END with error flag 전송 (S3가 OTA 포기)
+  spiSendOtaBlock(nullptr, 0, 0, 0, SPI_FLAG_END | SPI_FLAG_OTA_ERR);
+  g_otaS3.active = false;
+  Serial1.println("@cam,1");
+  if (controlClientConnected())
+    wsControl.sendTXT(g_controlClientNum, "@ota,cancelled");
 }
 
 // =============================================================
@@ -334,30 +801,7 @@ static void startPassthruMode() {
 
 #endif // CFG_PASSTHRU_ENABLE
 
-// -----------------------------
-// WebSocket servers (Links2004/arduinoWebSockets)
-// -----------------------------
-WebSocketsServer wsControl(CFG_WS_CONTROL_PORT);
-// volatile: taskWsUart에서 쓰기, taskSpiPull에서 읽기 가능
-static volatile bool hasControlClient = false;
-static volatile uint8_t g_controlClientNum = 0xFF;
-
-#if ENABLE_CAMERA_BRIDGE
-WebSocketsServer wsCamera(CFG_WS_CAMERA_PORT);
-// volatile: taskWsUart에서 쓰기, taskSpiPull에서 읽기 가능
-static volatile bool hasCameraClient = false;
-static volatile uint8_t g_cameraClientNum = 0xFF;
-#endif
-
-static inline bool controlClientConnected() {
-  return hasControlClient && g_controlClientNum != 0xFF && wsControl.clientIsConnected(g_controlClientNum);
-}
-
-#if ENABLE_CAMERA_BRIDGE
-static inline bool cameraClientConnected() {
-  return hasCameraClient && g_cameraClientNum != 0xFF && wsCamera.clientIsConnected(g_cameraClientNum);
-}
-#endif
+// (wsControl, wsCamera 등 WebSocket 전역 변수는 파일 상단 OTA 섹션 앞으로 이동됨)
 
 // forward declaration (used by poll* functions below)
 static void sendLedLinkStateToS3(bool force);
@@ -440,7 +884,7 @@ static void sendLedLinkStateToS3(bool force) {
 // -----------------------------
 static_assert(SPI_BLOCK_BYTES >= sizeof(DcmSpiHdr), "SPI block too small for DcmSpiHdr");
 
-static uint8_t g_spiRx[SPI_BLOCK_BYTES];
+// g_spiRx는 파일 상단(SPI link 섹션)에서 이미 선언됨 — OTA + 카메라 공용
 
 // 최신 프레임 캐시(WS 송출용). SPI task가 업데이트하고, WS task가 읽음.
 static uint8_t g_frameBuf[CFG_FRAME_BUF_SIZE];
@@ -666,12 +1110,47 @@ static void onControlWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_
       break;
     }
     case WStype_TEXT: {
-      // active control client의 텍스트만 S3로 전달
-      if (num == g_controlClientNum && payload && length > 0) {
-        static constexpr size_t kMaxFwd = 256;
-        const size_t fwdLen = (length > kMaxFwd) ? kMaxFwd : length;
-        Serial1.write(payload, fwdLen);
-        Serial1.write('\n');
+      if (num != g_controlClientNum || !payload || length == 0) break;
+
+      // OTA 명령 인터셉트 (@ota,* 는 S3로 전달하지 않음)
+      if (length >= 4 && strncmp((const char*)payload, "@ota", 4) == 0) {
+        const char* cmd = (const char*)payload;
+        if (strncmp(cmd, "@ota,start,rtl,", 15) == 0) {
+          const uint32_t sz = (uint32_t)atol(cmd + 15);
+          otaBegin(sz);
+        } else if (strncmp(cmd, "@ota,start,s3,", 14) == 0) {
+          // v0.1.9: S3 SPI OTA
+          const uint32_t sz = (uint32_t)atol(cmd + 14);
+          otaS3Begin(sz);
+        } else if (strncmp(cmd, "@ota,end,", 9) == 0) {
+          const uint32_t sz = (uint32_t)atol(cmd + 9);
+          if (g_otaS3.active) otaS3End(sz);
+          else                otaEnd(sz);
+        } else if (strcmp(cmd, "@ota,cancel") == 0) {
+          if (g_otaS3.active) otaS3Cancel();
+          else                otaCancel();
+        } else {
+          if (controlClientConnected())
+            wsControl.sendTXT(g_controlClientNum, "@ota,error,unsupported_command");
+        }
+        break;
+      }
+
+      // OTA 진행 중이면 일반 명령 S3 전달 차단
+      if (g_ota.active || g_otaS3.active) break;
+
+      // 일반 텍스트 → S3 UART 전달
+      static constexpr size_t kMaxFwd = 256;
+      const size_t fwdLen = (length > kMaxFwd) ? kMaxFwd : length;
+      Serial1.write(payload, fwdLen);
+      Serial1.write('\n');
+      break;
+    }
+    case WStype_BIN: {
+      // OTA binary 청크 수신
+      if (num == g_controlClientNum && payload && length > 8) {
+        if (g_otaS3.active)   otaS3WriteChunk(payload, length);
+        else if (g_ota.active) otaWriteChunk(payload, length);
       }
       break;
     }
@@ -882,7 +1361,10 @@ static void handleSerialCommand(const char* cmd) {
 #endif
       "\"crc_err\":%lu,"
       "\"spi_hz\":%lu,"
-      "\"buf_size\":%u"
+      "\"buf_size\":%u,"
+      "\"fw_version\":\"%s\","
+      "\"ota_active\":%d,"
+      "\"ota_s3_active\":%d"
       "}",
       (unsigned long)uptimeSec,
       g_apChannel,
@@ -895,7 +1377,10 @@ static void handleSerialCommand(const char* cmd) {
 #endif
       (unsigned long)g_statCrcErrors,
       (unsigned long)SPI_HZ,
-      (unsigned)sizeof(g_frameBuf)
+      (unsigned)sizeof(g_frameBuf),
+      CFG_FW_VERSION,
+      (int)g_ota.active,
+      (int)g_otaS3.active
     );
     Serial.println(diagBuf);
     if (controlClientConnected()) {

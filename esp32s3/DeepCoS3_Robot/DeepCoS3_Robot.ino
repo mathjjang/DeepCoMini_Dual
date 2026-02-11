@@ -1,5 +1,6 @@
 /*
   DeepCoS3_Robot.ino (ESP32‑S3, Arduino IDE)
+  FW Version: 0.1.9  (config.h CFG_FW_VERSION 과 일치시킬 것)
 
   목표:
   - 기존 DeepcoMini_v1.3의 "카메라/모터/LED/커맨드 파싱"을 유지
@@ -113,6 +114,9 @@ static void ledUpdateOnce();
 
 // Motors
 #include <FastAccelStepper.h>
+
+// v0.1.9: SPI OTA
+#include <Update.h>
 
 // -----------------------------
 // UART link (RTL <-> S3) — 설정은 config.h
@@ -259,6 +263,143 @@ static bool spiSlaveInit() {
   return true;
 }
 
+// =============================================================
+// v0.1.9: SPI OTA 수신기 (RTL→S3 SPI OTA)
+//
+// RTL이 DcmSpiHdr(type=SPI_TYPE_OTA) + firmware payload를
+// SPI로 보내면, S3는 RX 버퍼에서 꺼내 Update.h로 Flash 기록.
+// 응답은 TX 버퍼에 DcmSpiHdr(type=SPI_TYPE_OTA_ACK).
+// =============================================================
+static struct {
+  bool     active;
+  uint32_t expectedSize;
+  uint32_t received;
+  uint16_t lastSeq;
+  bool     error;
+  bool     rebootPending;
+  uint32_t rebootAtMs;
+} g_s3Ota = {};
+
+static void stopRobot(); // forward declaration
+
+static void fillOtaAckBlock(uint8_t* buf) {
+  memset(buf, 0, SPI_BLOCK_BYTES);
+  DcmSpiHdr* h = (DcmSpiHdr*)buf;
+  h->magic[0] = 'D'; h->magic[1] = 'C'; h->magic[2] = 'M'; h->magic[3] = '2';
+  h->type = SPI_TYPE_OTA_ACK;
+  h->flags = g_s3Ota.error ? SPI_FLAG_OTA_ERR : 0;
+  h->seq = g_s3Ota.lastSeq;
+  h->total_len = g_s3Ota.received;
+  h->payload_len = 0;
+  h->crc16 = 0;
+}
+
+static void handleSpiOtaBlock(const uint8_t* rxBuf) {
+  const DcmSpiHdr* hdr = (const DcmSpiHdr*)rxBuf;
+
+  // Magic / Type 검증
+  if (hdr->magic[0] != 'D' || hdr->magic[1] != 'C' ||
+      hdr->magic[2] != 'M' || hdr->magic[3] != '2') return;
+  if (hdr->type != SPI_TYPE_OTA) return;
+
+  const uint8_t* payload = rxBuf + sizeof(DcmSpiHdr);
+  const uint16_t pl = hdr->payload_len;
+  g_s3Ota.lastSeq = hdr->seq;
+
+  // START 블록: OTA 초기화
+  if (hdr->flags & SPI_FLAG_START) {
+    // 에러 플래그가 있으면 OTA 취소 (RTL cancel)
+    if (hdr->flags & SPI_FLAG_OTA_ERR) {
+      if (g_s3Ota.active) {
+        Update.abort();
+        g_s3Ota.active = false;
+        linkLogf("OTA cancelled by RTL");
+      }
+      return;
+    }
+
+    stopRobot();
+    g_s3Ota.active = true;
+    g_s3Ota.expectedSize = hdr->total_len;
+    g_s3Ota.received = 0;
+    g_s3Ota.error = false;
+    g_s3Ota.rebootPending = false;
+
+    linkLogf("OTA begin: %lu bytes", (unsigned long)hdr->total_len);
+
+    if (!Update.begin(hdr->total_len)) {
+      g_s3Ota.error = true;
+      g_s3Ota.active = false;
+      linkLogf("OTA Update.begin() failed");
+    }
+    return; // START 블록에는 payload 없음
+  }
+
+  // END 블록: OTA 완료
+  if (hdr->flags & SPI_FLAG_END) {
+    if (!g_s3Ota.active) return;
+
+    if (hdr->flags & SPI_FLAG_OTA_ERR) {
+      Update.abort();
+      g_s3Ota.active = false;
+      g_s3Ota.error = true;
+      linkLogf("OTA aborted by RTL (end+err)");
+      return;
+    }
+
+    if (g_s3Ota.received != g_s3Ota.expectedSize) {
+      Update.abort();
+      g_s3Ota.error = true;
+      g_s3Ota.active = false;
+      linkLogf("OTA size mismatch: got %lu expected %lu",
+               (unsigned long)g_s3Ota.received,
+               (unsigned long)g_s3Ota.expectedSize);
+      return;
+    }
+
+    if (!Update.end(true)) {
+      g_s3Ota.error = true;
+      g_s3Ota.active = false;
+      linkLogf("OTA Update.end() failed");
+      return;
+    }
+
+    linkLogf("OTA SUCCESS: %lu bytes, rebooting in 2s",
+             (unsigned long)g_s3Ota.received);
+    g_s3Ota.active = false;
+    g_s3Ota.rebootPending = true;
+    g_s3Ota.rebootAtMs = millis() + 2000;
+    return;
+  }
+
+  // DATA 블록: Flash 기록
+  if (!g_s3Ota.active || g_s3Ota.error) return;
+
+  if (pl == 0) return;
+  if (pl > SPI_BLOCK_BYTES - sizeof(DcmSpiHdr)) {
+    g_s3Ota.error = true;
+    linkLogf("OTA payload too large: %u", pl);
+    return;
+  }
+
+  // CRC 검증
+  const uint16_t calcCrc = crc16Ccitt(payload, pl);
+  if (calcCrc != hdr->crc16) {
+    g_s3Ota.error = true;
+    linkLogf("OTA CRC error: calc=0x%04X hdr=0x%04X", calcCrc, hdr->crc16);
+    return;
+  }
+
+  // Flash 기록
+  const size_t written = Update.write((uint8_t*)payload, pl);
+  if (written != pl) {
+    g_s3Ota.error = true;
+    linkLogf("OTA write fail: wrote %u / %u", (unsigned)written, (unsigned)pl);
+    return;
+  }
+  g_s3Ota.received += pl;
+}
+
 static void spiSlavePoll() {
   // 고속 링크에서는 한 loop()에 트랜잭션 완료가 여러 개 쌓일 수 있어 전부 소진
   for (;;) {
@@ -270,11 +411,27 @@ static void spiSlavePoll() {
 
     for (int i = 0; i < SPI_QUEUE_SIZE; i++) {
       if (done == &g_trans[i]) {
-        fillTxBlock(g_spiTx[i]);
+        // v0.1.9: RX 버퍼에서 OTA 데이터 확인
+        const DcmSpiHdr* rxHdr = (const DcmSpiHdr*)g_spiRx[i];
+        if (rxHdr->type == SPI_TYPE_OTA &&
+            rxHdr->magic[0] == 'D' && rxHdr->magic[1] == 'C' &&
+            rxHdr->magic[2] == 'M' && rxHdr->magic[3] == '2') {
+          handleSpiOtaBlock(g_spiRx[i]);
+          fillOtaAckBlock(g_spiTx[i]); // 응답을 TX에 적재
+        } else {
+          fillTxBlock(g_spiTx[i]); // 일반 카메라 프레임
+        }
         spi_slave_queue_trans(SPI2_HOST, &g_trans[i], portMAX_DELAY);
         break;
       }
     }
+  }
+
+  // v0.1.9: OTA 후 지연 리부팅
+  if (g_s3Ota.rebootPending && millis() >= g_s3Ota.rebootAtMs) {
+    linkLogf("OTA reboot now");
+    delay(100);
+    ESP.restart();
   }
 }
 

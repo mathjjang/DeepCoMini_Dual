@@ -5,6 +5,61 @@
 
 ---
 
+## [v0.1.7] — 2026-02-11 — WebSocket 라이브러리 교체 (arduinoWebSockets)
+
+### 배경
+- 커스텀 MiniWS.h는 최소 기능만 구현한 프로토타입이었으나, 검증된 오픈소스로 교체하여 안정성 확보
+- Links2004/arduinoWebSockets가 `NETWORK_AMEBAD` (RTL8720DN)를 네이티브 지원
+- 프로젝트 로컬 복사본(`src/dc_ws/`)으로 글로벌 라이브러리 패치 불필요
+
+### WebSocket 아키텍처 변경
+- **MiniWS.h (커스텀) → arduinoWebSockets (Links2004)** 교체
+  - `MiniWsServer` / `MiniWsClient` 제거 → `WebSocketsServer` 이벤트 기반 전환
+  - `src/dc_ws/` 프로젝트 로컬 복사본: WebSockets.h/cpp, WebSocketsServer.h/cpp, libb64, libsha1
+  - `NETWORK_AMEBAD` 자동 감지 (`ARDUINO_AMEBA` / `ARDUINO_ARCH_AMEBAD` / `CONFIG_PLATFORM_8721D`)
+- **이벤트 콜백 패턴**
+  - `onControlWsEvent(num, type, payload, length)` — WStype_CONNECTED / DISCONNECTED / TEXT 처리
+  - `onCameraWsEvent(num, type, payload, length)` — WStype_CONNECTED / DISCONNECTED 처리
+  - 경로 검증: control은 `/ws`만 허용, camera는 `/` 또는 빈 경로만 허용 (불일치 시 즉시 disconnect)
+- **클라이언트 번호 추적**
+  - `g_controlClientNum` / `g_cameraClientNum` (uint8_t, 0xFF = 미연결)
+  - `controlClientConnected()` / `cameraClientConnected()` 인라인 헬퍼 함수
+  - `clientIsConnected(num)` 기반 3중 체크 (flag + num + 라이브러리 확인)
+- **단일 클라이언트 정책**: 새 연결 시 기존 클라이언트 자동 disconnect 후 교체
+- **연결 시 안전 정지**: control 연결 직후 `sendSafetyStopToS3()` 자동 호출
+
+### RTOS 프레임 전송 개선
+- **Mutex 점유 시간 대폭 단축** (`taskWsUart`)
+  - Before: mutex 잡은 상태로 `sendBinary()` (네트워크 전송 대기 포함)
+  - After: mutex 구간에서 `malloc + memcpy`만 수행 → mutex 해제 → `sendBIN()` → `free()`
+  - SPI 태스크가 mutex 대기하는 시간 최소화 → 프레임 수집 연속성 향상
+
+### AP STA 카운트 실제 API 사용
+- **`wifi_get_associated_client_list()`** (Realtek wifi_conf.h)
+  - `extern "C" { #include "wifi_conf.h" }` 추가
+  - `rtw_maclist_t` 기반 실제 연결 클라이언트 수 조회
+  - 기존 추정치 대신 AP 드라이버 직접 조회 → LED 상태 정확도 향상
+
+### 정리
+- **MiniWS.h 삭제**: 더 이상 사용하지 않음
+- **빈 함수 제거**: `acceptControlIfAny()` / `acceptCameraIfAny()` 불필요 (arduinoWebSockets가 `loop()` 내에서 자동 처리)
+- **forward declaration 추가**: `sendLedLinkStateToS3(bool force)` — 함수 순서 의존성 해소
+
+### 변경 파일
+- `rtl8720dn/DeepCoRTL_Bridge/MiniWS.h` — **삭제**
+- `rtl8720dn/DeepCoRTL_Bridge/src/dc_ws/` — **신규**: arduinoWebSockets 프로젝트 로컬 복사
+  - `WebSockets.h/cpp`, `WebSocketsServer.h/cpp`, `WebSocketsVersion.h`
+  - `libb64/cencode.c`, `libb64/cencode_inc.h`
+  - `libsha1/libsha1.h`
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — WebSocket 전면 교체
+  - MiniWS include → `src/dc_ws/WebSocketsServer.h`
+  - 이벤트 콜백 2개 신규 (`onControlWsEvent`, `onCameraWsEvent`)
+  - 클라이언트 번호 추적 + 헬퍼 함수
+  - RTOS taskWsUart: malloc+copy 패턴으로 mutex 최적화
+  - `extern "C" wifi_conf.h` + `getApStaCount()` 실제 API
+
+---
+
 ## [v0.1.6] — 2026-02-11 — 동시성 안전 + 메모리 안정성 + 프로토콜 강화
 
 ### 배경

@@ -8,7 +8,8 @@
     - camera : ws://192.168.4.1:81/     (port 81)
   - 수신한 제어 문자열을 UART로 ESP32‑S3에게 전달
 
-  필요 라이브러리: 없음 (MiniWS.h 자체 구현, 외부 WebSocket 라이브러리 불필요)
+  필요 라이브러리(Arduino Library Manager):
+  - WebSockets (Links2004/arduinoWebSockets)
 
   보드 패키지:
   - Realtek AmebaD (RTL8720DN) 보드 매니저 설치 필요
@@ -20,7 +21,7 @@
 #include <WiFi.h>
 #include <SPI.h>
 
-// 경량 WebSocket 구현 (Ameba RTL8720DN 전용, 외부 라이브러리 불필요)
+// WebSocketsServer (Links2004/arduinoWebSockets)
 // Arduino min/max 매크로 충돌 방지
 #ifdef min
 #undef min
@@ -28,7 +29,7 @@
 #ifdef max
 #undef max
 #endif
-#include "MiniWS.h"
+#include "src/dc_ws/WebSocketsServer.h" // project-local copy (no global library patch)
 
 // Realtek/Ameba low-level Wi-Fi API (AP client list)
 extern "C" {
@@ -322,18 +323,56 @@ static void startPassthruMode() {
 #endif // CFG_PASSTHRU_ENABLE
 
 // -----------------------------
-// WebSocket servers
+// WebSocket servers (Links2004/arduinoWebSockets)
 // -----------------------------
-MiniWsServer wsControl;
-MiniWsClient controlClient;   // single client (DeepCoConnector 1개 전제)
+WebSocketsServer wsControl(CFG_WS_CONTROL_PORT);
 // volatile: taskWsUart에서 쓰기, taskSpiPull에서 읽기 가능
 static volatile bool hasControlClient = false;
+static volatile uint8_t g_controlClientNum = 0xFF;
 
 #if ENABLE_CAMERA_BRIDGE
-MiniWsServer wsCamera;
-MiniWsClient cameraClient;
+WebSocketsServer wsCamera(CFG_WS_CAMERA_PORT);
 // volatile: taskWsUart에서 쓰기, taskSpiPull에서 읽기 가능
 static volatile bool hasCameraClient = false;
+static volatile uint8_t g_cameraClientNum = 0xFF;
+#endif
+
+static inline bool controlClientConnected() {
+  return hasControlClient && g_controlClientNum != 0xFF && wsControl.clientIsConnected(g_controlClientNum);
+}
+
+#if ENABLE_CAMERA_BRIDGE
+static inline bool cameraClientConnected() {
+  return hasCameraClient && g_cameraClientNum != 0xFF && wsCamera.clientIsConnected(g_cameraClientNum);
+}
+#endif
+
+// forward declaration (used by poll* functions below)
+static void sendLedLinkStateToS3(bool force);
+
+static void pollControlClient() {
+  wsControl.loop();
+  if (hasControlClient && !wsControl.clientIsConnected(g_controlClientNum)) {
+    hasControlClient = false;
+    g_controlClientNum = 0xFF;
+    sendSafetyStopToS3();
+    sendLedLinkStateToS3(true);
+    return;
+  }
+  sendLedLinkStateToS3(false);
+}
+
+#if ENABLE_CAMERA_BRIDGE
+static void pollCameraClient() {
+  wsCamera.loop();
+  if (hasCameraClient && !wsCamera.clientIsConnected(g_cameraClientNum)) {
+    hasCameraClient = false;
+    g_cameraClientNum = 0xFF;
+    sendLedLinkStateToS3(true);
+    return;
+  }
+  sendLedLinkStateToS3(false);
+}
 #endif
 
 // -----------------------------
@@ -359,7 +398,7 @@ static uint16_t getApStaCount() {
   return (uint16_t)ml->count;
 }
 
-static void sendLedLinkStateToS3(bool force = false) {
+static void sendLedLinkStateToS3(bool force) {
   // station count polling (1Hz)
   const uint32_t nowMs = millis();
   if (force || (nowMs - g_lastStaPollMs >= 1000)) {
@@ -368,7 +407,7 @@ static void sendLedLinkStateToS3(bool force = false) {
   }
 
   // staCount==0이면 WS도 존재할 수 없으므로 즉시 0으로 강등(v1.3과 동일한 안전 로직)
-  uint8_t wsNow = (hasControlClient && controlClient.available()) ? 1 : 0;
+  uint8_t wsNow = controlClientConnected() ? 1 : 0;
   if (g_ledStaCount == 0) wsNow = 0;
 
   if (force || wsNow != g_ledWs) {
@@ -588,26 +627,84 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
   return false;
 }
 
-// MiniWS 콜백: 텍스트 메시지 → S3로 전달
-static void _onControlMsg(const String& msg) {
-  Serial1.println(msg);
-}
-// MiniWS 콜백: 연결 해제 → 안전 정지
-static void _onControlClose() {
-  hasControlClient = false;
-  sendSafetyStopToS3();
-}
-static void attachControlCallbacks(MiniWsClient& c) {
-  c.setCallbacks(_onControlMsg, _onControlClose);
+// WebSocket 콜백: control 서버
+static void onControlWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      const char* path = (payload != nullptr) ? (const char*)payload : "";
+      // 기존 DeepCoConnector 규약: control는 /ws 경로
+      if (strcmp(path, "/ws") != 0) {
+        wsControl.disconnect(num);
+        return;
+      }
+
+      // single-client 정책: 기존 연결 종료
+      if (hasControlClient && g_controlClientNum != num && wsControl.clientIsConnected(g_controlClientNum)) {
+        wsControl.disconnect(g_controlClientNum);
+      }
+      g_controlClientNum = num;
+      hasControlClient = true;
+      Serial.println("[RTL] control WS client connected");
+      sendLedLinkStateToS3(true);
+      // 안전: 연결되자마자 stop 한번
+      sendSafetyStopToS3();
+      break;
+    }
+    case WStype_DISCONNECTED: {
+      if (num == g_controlClientNum) {
+        hasControlClient = false;
+        g_controlClientNum = 0xFF;
+        sendSafetyStopToS3();
+        sendLedLinkStateToS3(true);
+      }
+      break;
+    }
+    case WStype_TEXT: {
+      // active control client의 텍스트만 S3로 전달
+      if (num == g_controlClientNum && payload && length > 0) {
+        Serial1.write(payload, length);
+        Serial1.write('\n');
+      }
+      break;
+    }
+    default:
+      break;
+  }
 }
 
 #if ENABLE_CAMERA_BRIDGE
-// MiniWS 콜백: 카메라 연결 해제
-static void _onCameraClose() {
-  hasCameraClient = false;
-}
-static void attachCameraCallbacks(MiniWsClient& c) {
-  c.setCallbacks(nullptr, _onCameraClose);
+// WebSocket 콜백: camera 서버
+static void onCameraWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  (void)length;
+  switch (type) {
+    case WStype_CONNECTED: {
+      const char* path = (payload != nullptr) ? (const char*)payload : "";
+      // camera는 "/" 또는 빈 경로를 허용
+      if (!(strcmp(path, "/") == 0 || path[0] == '\0')) {
+        wsCamera.disconnect(num);
+        return;
+      }
+
+      if (hasCameraClient && g_cameraClientNum != num && wsCamera.clientIsConnected(g_cameraClientNum)) {
+        wsCamera.disconnect(g_cameraClientNum);
+      }
+      g_cameraClientNum = num;
+      hasCameraClient = true;
+      Serial.println("[RTL] camera WS client connected");
+      sendLedLinkStateToS3(true);
+      break;
+    }
+    case WStype_DISCONNECTED: {
+      if (num == g_cameraClientNum) {
+        hasCameraClient = false;
+        g_cameraClientNum = 0xFF;
+        sendLedLinkStateToS3(true);
+      }
+      break;
+    }
+    default:
+      break;
+  }
 }
 #endif
 
@@ -678,11 +775,13 @@ void setup() {
   sendLedLinkStateToS3(true);
 
   // WebSocket servers — config.h
-  wsControl.listen(CFG_WS_CONTROL_PORT);
+  wsControl.begin();
+  wsControl.onEvent(onControlWsEvent);
   RTL_PRINTF(Serial, "[RTL] WS control listening on :%d (/ws accepted)\n", CFG_WS_CONTROL_PORT);
 
 #if ENABLE_CAMERA_BRIDGE
-  wsCamera.listen(CFG_WS_CAMERA_PORT);
+  wsCamera.begin();
+  wsCamera.onEvent(onCameraWsEvent);
   RTL_PRINTF(Serial, "[RTL] WS camera listening on :%d (/ accepted)\n", CFG_WS_CAMERA_PORT);
 #else
   Serial.println("[RTL] Camera bridge disabled (ENABLE_CAMERA_BRIDGE=0)");
@@ -699,71 +798,9 @@ void setup() {
 #endif
 }
 
-static void acceptControlIfAny() {
-  // poll()이 true면 accept 가능성이 있음
-  if (!wsControl.poll()) return;
-  if (!wsControl.available()) return;
-
-  MiniWsClient c = wsControl.accept();
-  if (!c.available()) return;
-
-  // single-client 정책: 기존 연결 종료
-  if (hasControlClient && controlClient.available()) {
-    controlClient.close();
-  }
-
-  controlClient = c;
-  hasControlClient = true;
-  attachControlCallbacks(controlClient);
-  Serial.println("[RTL] control WS client connected");
-  sendLedLinkStateToS3(true);
-
-  // 안전: 연결되자마자 stop 한번
-  sendSafetyStopToS3();
-}
-
-static void pollControlClient() {
-  if (!hasControlClient) return;
-  if (!controlClient.available()) {
-    hasControlClient = false;
-    sendSafetyStopToS3();
-    sendLedLinkStateToS3(true);
-    return;
-  }
-  controlClient.poll(); // ping/pong 포함 처리 + 메시지 콜백 호출
-  sendLedLinkStateToS3(false);
-}
-
-#if ENABLE_CAMERA_BRIDGE
-static void acceptCameraIfAny() {
-  if (!wsCamera.poll()) return;
-  if (!wsCamera.available()) return;
-
-  MiniWsClient c = wsCamera.accept();
-  if (!c.available()) return;
-
-  if (hasCameraClient && cameraClient.available()) {
-    cameraClient.close();
-  }
-
-  cameraClient = c;
-  hasCameraClient = true;
-  attachCameraCallbacks(cameraClient);
-  Serial.println("[RTL] camera WS client connected");
-  sendLedLinkStateToS3(true);
-}
-
-static void pollCameraClient() {
-  if (!hasCameraClient) return;
-  if (!cameraClient.available()) {
-    hasCameraClient = false;
-    sendLedLinkStateToS3(true);
-    return;
-  }
-  cameraClient.poll();
-  sendLedLinkStateToS3(false);
-}
-#endif
+// -----------------------------
+// WebSocket servers (Links2004/arduinoWebSockets)
+// -----------------------------
 
 // -----------------------------
 // v0.1.1: USB Serial 설정 명령 처리
@@ -845,8 +882,8 @@ static void handleSerialCommand(const char* cmd) {
       (unsigned)sizeof(g_frameBuf)
     );
     Serial.println(diagBuf);
-    if (hasControlClient && controlClient.available()) {
-      controlClient.send(diagBuf);
+    if (controlClientConnected()) {
+      wsControl.sendTXT(g_controlClientNum, diagBuf);
     }
     RTL_PRINTF(Serial, "[RTL] Uptime: %lum %lus\n", (unsigned long)uptimeMin, (unsigned long)(uptimeSec % 60));
   } else if (strncmp(cmd, "@s3debug,", 9) == 0) {
@@ -934,13 +971,13 @@ static void pumpS3TextToWs() {
         else if (strncmp(s3Buf, "@err,", 5) == 0) {
           Serial.print("[S3][ERR] ");
           Serial.println(s3Buf + 5);
-          if (hasControlClient && controlClient.available()) {
-            controlClient.send(s3Buf);  // PC에 "@err,코드,메시지" 그대로 전달
+          if (controlClientConnected()) {
+            wsControl.sendTXT(g_controlClientNum, s3Buf);  // PC에 "@err,코드,메시지" 그대로 전달
           }
         } else {
           // 그 외 텍스트는 (선택) WS control로 echo
-          if (hasControlClient && controlClient.available()) {
-            controlClient.send(s3Buf);
+          if (controlClientConnected()) {
+            wsControl.sendTXT(g_controlClientNum, s3Buf);
           }
         }
       }
@@ -969,13 +1006,11 @@ void loop() {
 #endif
 
   // loop() 폴백 모드(기존 동작 유지)
-  acceptControlIfAny();
   pollControlClient();
 
 #if ENABLE_CAMERA_BRIDGE
-  acceptCameraIfAny();
   pollCameraClient();
-  g_wantStream = (hasCameraClient && cameraClient.available());
+  g_wantStream = cameraClientConnected();
 
   // 카메라: SPI로 프레임을 "항상" 받아서 최신 프레임 유지
   static uint32_t lastPullMs = 0;
@@ -988,7 +1023,7 @@ void loop() {
     if (pullOneJpegFrameOverSpi(g_wantStream ? 120 : 20)) {
       if (g_wantStream && beforeSeq != g_frameSeq) {
         // DeepCoConnector는 WS Binary message 1개 = JPEG 1장 전제를 갖고 있음
-        (void)cameraClient.sendBinary((const char*)g_frameBuf, (size_t)g_frameLen);
+        (void)wsCamera.sendBIN(g_cameraClientNum, (const uint8_t*)g_frameBuf, (size_t)g_frameLen);
       }
       // wantStream=false면: 최신 프레임만 캐시해두고 송출은 안 함
     }
@@ -1027,28 +1062,42 @@ static void taskWsUart(void* arg) {
   uint32_t lastBeatMs = millis();
 
   for (;;) {
-    acceptControlIfAny();
     pollControlClient();
 
 #if ENABLE_CAMERA_BRIDGE
-    acceptCameraIfAny();
     pollCameraClient();
-    g_wantStream = (hasCameraClient && cameraClient.available());
+    g_wantStream = cameraClientConnected();
 
     // 최신 프레임이 갱신되면 송출
     if (g_wantStream) {
       uint16_t curSeq = 0;
       size_t curLen = 0;
+      bool needSend = false;
+      uint8_t* txBuf = nullptr;
+
       if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
+      // --- Mutex Critical Section Start ---
       curSeq = g_frameSeq;
       curLen = (size_t)g_frameLen;
 
-      if (curLen > 0 && curSeq != 0 && curSeq != lastSentSeq && cameraClient.available()) {
-        // mutex를 잡은 상태에서 송출(안전성 우선)
-        (void)cameraClient.sendBinary((const char*)g_frameBuf, curLen);
-        lastSentSeq = curSeq;
+      if (curLen > 0 && curSeq != 0 && curSeq != lastSentSeq && cameraClientConnected()) {
+        // [개선] 정적 RAM 점유를 피하기 위해 전송 직전에 동적 버퍼 할당
+        // 할당 성공 시: Mutex 구간에서는 memcpy만 수행 후 즉시 해제
+        txBuf = (uint8_t*)malloc(curLen);
+        if (txBuf != nullptr) {
+          memcpy(txBuf, g_frameBuf, curLen);
+          lastSentSeq = curSeq;
+          needSend = true;
+        }
       }
+      // --- Mutex Critical Section End ---
       if (g_frameMutex) xSemaphoreGive(g_frameMutex);
+
+      // Mutex 해제 후, 복사된 데이터로 네트워크 전송 수행
+      if (needSend) {
+        (void)wsCamera.sendBIN(g_cameraClientNum, (const uint8_t*)txBuf, curLen);
+        free(txBuf);
+      }
     }
 
     // 성능 로그: SPI task가 stat을 올리고, 출력만 여기서

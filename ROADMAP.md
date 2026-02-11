@@ -102,6 +102,19 @@
 
 ---
 
+## v0.1.7 — WebSocket 라이브러리 교체 (arduinoWebSockets)
+
+- [x] MiniWS.h → Links2004/arduinoWebSockets 교체 (NETWORK_AMEBAD 네이티브)
+- [x] src/dc_ws/ 프로젝트 로컬 복사본 (글로벌 패치 불필요)
+- [x] 이벤트 콜백 기반 WS 처리 (onControlWsEvent, onCameraWsEvent)
+- [x] 경로 검증: control=/ws, camera=/ (불일치 시 disconnect)
+- [x] 클라이언트 번호 추적 (g_controlClientNum, g_cameraClientNum)
+- [x] RTOS taskWsUart: malloc+copy 패턴으로 mutex 점유 시간 단축
+- [x] AP STA 카운트: wifi_get_associated_client_list() 실제 API 사용
+- [x] MiniWS.h 삭제, 빈 accept 함수 제거
+
+---
+
 ## Backlog (미배정 — 필요 시 버전에 할당)
 
 - [ ] OTA(무선) 펌웨어 업데이트 지원 (누적 단계 2)
@@ -130,3 +143,4 @@
 | v0.1.4 | 2026-02-09 | MAC 기반 채널 자동 분산, 듀얼칩 설계전략 문서 |
 | v0.1.5 | 2026-02-11 | 옵션 E: S3 패스스루 플래시, @passthru 명령 |
 | v0.1.6 | 2026-02-11 | 동시성 안전, 메모리 안정성, WS 프로토콜 강화 |
+| v0.1.7 | 2026-02-11 | WebSocket: MiniWS→arduinoWebSockets, RTOS mutex 최적화 |

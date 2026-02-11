@@ -8,8 +8,7 @@
     - camera : ws://192.168.4.1:81/     (port 81)
   - 수신한 제어 문자열을 UART로 ESP32‑S3에게 전달
 
-  필요 라이브러리(Arduino Library Manager):
-  - WebSockets2_Generic (khoih-prog)  -> #include <ArduinoWebsockets.h>
+  필요 라이브러리: 없음 (MiniWS.h 자체 구현, 외부 WebSocket 라이브러리 불필요)
 
   보드 패키지:
   - Realtek AmebaD (RTL8720DN) 보드 매니저 설치 필요
@@ -21,14 +20,28 @@
 #include <WiFi.h>
 #include <SPI.h>
 
-// WebSockets2_Generic uses ArduinoWebsockets API (gilmaimon/TinyWebsockets 기반)
-#include <ArduinoWebsockets.h>
-using namespace websockets;
+// 경량 WebSocket 구현 (Ameba RTL8720DN 전용, 외부 라이브러리 불필요)
+// Arduino min/max 매크로 충돌 방지
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+#include "MiniWS.h"
 
 // Realtek/Ameba low-level Wi-Fi API (AP client list)
 extern "C" {
   #include "wifi_conf.h"
 }
+
+// -------------------------------------------------------
+// Ameba RTL8720DN: LOGUARTClass / UARTClassTwo에 printf()가 없음
+// snprintf + print 로 에뮬레이션하는 헬퍼 매크로
+// 스택 로컬 버퍼 사용 → RTOS 태스크 동시 접근 안전
+// -------------------------------------------------------
+#define RTL_PRINTF(ser, fmt, ...) \
+  do { char _pf[192]; snprintf(_pf, sizeof(_pf), fmt, ##__VA_ARGS__); ser.print(_pf); } while(0)
 
 // -----------------------------
 // Optional: split work into RTOS tasks (if available)
@@ -83,16 +96,16 @@ static const IPAddress AP_DNS(CFG_AP_DNS_A, CFG_AP_DNS_B, CFG_AP_DNS_C, CFG_AP_D
 static const uint32_t LINK_BAUD = CFG_LINK_BAUD;
 
 // -----------------------------
-// Pin map (BW16 기준) — 참고용, variant에 의해 고정
+// Pin map (BW16 기준) — 참고용, variant.h에 의해 고정 (AMB_Dx 사용)
 // -----------------------------
-static constexpr int RTL_LOG_TX_PIN = D0;  // PA7 (USB 디버그)
-static constexpr int RTL_LOG_RX_PIN = D1;  // PA8
-static constexpr int RTL_LINK_TX_PIN = D4; // PB1, RTL→S3
-static constexpr int RTL_LINK_RX_PIN = D5; // PB2, S3→RTL
-static constexpr int RTL_SPI_SS_PIN_DOC   = D9;  // PA15
-static constexpr int RTL_SPI_SCLK_PIN_DOC = D10; // PA14
-static constexpr int RTL_SPI_MISO_PIN_DOC = D11; // PA13
-static constexpr int RTL_SPI_MOSI_PIN_DOC = D12; // PA12
+static constexpr int RTL_LOG_TX_PIN = AMB_D0;  // PA7 (USB 디버그)
+static constexpr int RTL_LOG_RX_PIN = AMB_D1;  // PA8
+static constexpr int RTL_LINK_TX_PIN = AMB_D4; // PB1, RTL→S3
+static constexpr int RTL_LINK_RX_PIN = AMB_D5; // PB2, S3→RTL
+static constexpr int RTL_SPI_SS_PIN_DOC   = AMB_D9;  // PA15
+static constexpr int RTL_SPI_SCLK_PIN_DOC = AMB_D10; // PA14
+static constexpr int RTL_SPI_MISO_PIN_DOC = AMB_D11; // PA13
+static constexpr int RTL_SPI_MOSI_PIN_DOC = AMB_D12; // PA12
 
 // -----------------------------
 // SPI link — 설정은 config.h
@@ -127,7 +140,7 @@ static int pickChannelFromMac() {
   WiFi.macAddress(mac);
   int idx = mac[5] % CFG_AP_CHANNEL_POOL_SIZE;
   int ch = channelPool[idx];
-  Serial.printf("[RTL] Auto-channel: MAC[5]=0x%02X → pool[%d] = ch %d\n", mac[5], idx, ch);
+  RTL_PRINTF(Serial, "[RTL] Auto-channel: MAC[5]=0x%02X → pool[%d] = ch %d\n", mac[5], idx, ch);
   return ch;
 #else
   return CFG_AP_CHANNEL_DEFAULT;
@@ -198,7 +211,8 @@ static void resetS3Normal() {
 static void runPassthruBridge() {
   Serial.println("[RTL] === PASSTHRU MODE START ===");
   Serial.println("[RTL] USB <-> UART transparent bridge active");
-  Serial.printf("[RTL] Timeout: %d ms (no data = exit)\n", CFG_PASSTHRU_TIMEOUT_MS);
+  Serial.println("[RTL] Press Ctrl+C x3 rapidly to force-exit");
+  RTL_PRINTF(Serial, "[RTL] Timeout: %d ms (no data = exit)\n", CFG_PASSTHRU_TIMEOUT_MS);
 
   g_passthruActive = true;
 
@@ -210,6 +224,13 @@ static void runPassthruBridge() {
   unsigned long lastDataTime = millis();
   uint8_t buf[256];
 
+  // 탈출 시퀀스 감지: Ctrl+C (0x03) x 3회를 500ms 이내에 입력
+  static const uint8_t ESC_BYTE = 0x03;  // Ctrl+C
+  static const uint8_t ESC_COUNT = 3;
+  static const uint32_t ESC_WINDOW_MS = 500;
+  uint8_t escHits = 0;
+  uint32_t escFirstMs = 0;
+
   while (g_passthruActive) {
     bool hadData = false;
 
@@ -219,6 +240,22 @@ static void runPassthruBridge() {
       int toRead = (avail > (int)sizeof(buf)) ? (int)sizeof(buf) : avail;
       int n = Serial.readBytes(buf, toRead);
       if (n > 0) {
+        // 탈출 시퀀스 검사 (Ctrl+C x3 연속)
+        for (int i = 0; i < n; i++) {
+          if (buf[i] == ESC_BYTE) {
+            if (escHits == 0) escFirstMs = millis();
+            escHits++;
+            if (escHits >= ESC_COUNT && (millis() - escFirstMs) < ESC_WINDOW_MS) {
+              Serial.println("\n[RTL] Ctrl+C x3 detected - force exiting passthru");
+              g_passthruActive = false;
+              break;
+            }
+          } else {
+            escHits = 0; // 비 ESC 바이트 → 카운터 리셋
+          }
+        }
+        if (!g_passthruActive) break;
+
         Serial1.write(buf, n);
         hadData = true;
       }
@@ -237,6 +274,11 @@ static void runPassthruBridge() {
 
     if (hadData) {
       lastDataTime = millis();
+    }
+
+    // 탈출 시퀀스 윈도우 만료 시 리셋
+    if (escHits > 0 && (millis() - escFirstMs) >= ESC_WINDOW_MS) {
+      escHits = 0;
     }
 
     // 타임아웃 체크
@@ -282,14 +324,16 @@ static void startPassthruMode() {
 // -----------------------------
 // WebSocket servers
 // -----------------------------
-WebsocketsServer wsControl;
-WebsocketsClient controlClient;   // single client (DeepCoConnector 1개 전제)
-static bool hasControlClient = false;
+MiniWsServer wsControl;
+MiniWsClient controlClient;   // single client (DeepCoConnector 1개 전제)
+// volatile: taskWsUart에서 쓰기, taskSpiPull에서 읽기 가능
+static volatile bool hasControlClient = false;
 
 #if ENABLE_CAMERA_BRIDGE
-WebsocketsServer wsCamera;
-WebsocketsClient cameraClient;
-static bool hasCameraClient = false;
+MiniWsServer wsCamera;
+MiniWsClient cameraClient;
+// volatile: taskWsUart에서 쓰기, taskSpiPull에서 읽기 가능
+static volatile bool hasCameraClient = false;
 #endif
 
 // -----------------------------
@@ -373,17 +417,45 @@ static SemaphoreHandle_t g_frameMutex = nullptr;
 #endif
 
 static volatile bool g_wantStream = false;
-static uint32_t g_statBlocks = 0;
-static uint32_t g_statFrames = 0;
-static uint32_t g_statBytes = 0;
+static volatile uint32_t g_statBlocks = 0;
+static volatile uint32_t g_statFrames = 0;
+static volatile uint32_t g_statBytes = 0;
 // v0.1.2: 에러 통계
-static uint32_t g_statSyncErrors = 0;   // 매직 불일치
-static uint32_t g_statSeqErrors = 0;    // 시퀀스/오프셋 불일치로 드랍
-static uint32_t g_statOversize = 0;     // 프레임 크기 초과로 드랍
+static volatile uint32_t g_statSyncErrors = 0;   // 매직 불일치
+static volatile uint32_t g_statSeqErrors = 0;    // 시퀀스/오프셋 불일치로 드랍
+static volatile uint32_t g_statOversize = 0;     // 프레임 크기 초과로 드랍
 
-static inline bool hdrLooksOk(const DcmSpiHdr& h) {
-  return (h.magic[0] == 'D' && h.magic[1] == 'C' && h.magic[2] == 'M' && h.magic[3] == '2');
-}
+// 통계 스냅샷: 매크로로 정의 (Arduino IDE 전처리기의 자동 프로토타입 생성이
+// struct 정의보다 앞에 놓여 에러 발생하는 문제 회피 — hdrLooksOk과 동일 패턴)
+// 사용법: SNAPSHOT_STATS(로컬변수prefix) → _블럭, _프레임 등 6개 로컬 변수 생성+리셋
+#if RTL_HAS_FREERTOS
+#define SNAPSHOT_AND_RESET_STATS(blk,frm,byt,syncE,seqE,ovs) \
+  do { \
+    taskENTER_CRITICAL(); \
+    blk  = g_statBlocks;     g_statBlocks     = 0; \
+    frm  = g_statFrames;     g_statFrames     = 0; \
+    byt  = g_statBytes;      g_statBytes      = 0; \
+    syncE = g_statSyncErrors; g_statSyncErrors = 0; \
+    seqE = g_statSeqErrors;  g_statSeqErrors  = 0; \
+    ovs  = g_statOversize;   g_statOversize   = 0; \
+    taskEXIT_CRITICAL(); \
+  } while(0)
+#else
+#define SNAPSHOT_AND_RESET_STATS(blk,frm,byt,syncE,seqE,ovs) \
+  do { \
+    blk  = g_statBlocks;     g_statBlocks     = 0; \
+    frm  = g_statFrames;     g_statFrames     = 0; \
+    byt  = g_statBytes;      g_statBytes      = 0; \
+    syncE = g_statSyncErrors; g_statSyncErrors = 0; \
+    seqE = g_statSeqErrors;  g_statSeqErrors  = 0; \
+    ovs  = g_statOversize;   g_statOversize   = 0; \
+  } while(0)
+#endif
+
+// 매크로로 정의 (Arduino IDE 전처리기의 자동 프로토타입 생성이
+// struct 정의보다 앞에 놓여 에러 발생하는 문제 회피)
+#define hdrLooksOk(h) \
+  ((h).magic[0] == 'D' && (h).magic[1] == 'C' && (h).magic[2] == 'M' && (h).magic[3] == '2')
 
 static bool spiReadBlock(uint8_t* dst, size_t len) {
   if (!dst || len == 0) return false;
@@ -488,20 +560,26 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
     if (pl > SPI_BLOCK_BYTES - headerSz) { haveHeader = false; continue; }
     if (hdr->offset + pl > expectedTotal) { haveHeader = false; continue; }
 
+    // mutex로 memcpy + 메타데이터 갱신을 원자적으로 보호
+    // (WS 태스크의 sendBinary도 mutex 하에 g_frameBuf 읽으므로 레이스 방지)
+#if RTL_HAS_FREERTOS
+    if (RTL_USE_TASKS && g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
+#endif
     memcpy(g_frameBuf + hdr->offset, g_spiRx + headerSz, pl);
     received += pl;
     g_statBytes += (uint32_t)pl;
 
     const bool isEnd = (hdr->flags & SPI_FLAG_END) != 0;
+    bool frameComplete = false;
     if (isEnd && received == expectedTotal) {
-#if RTL_HAS_FREERTOS
-      if (RTL_USE_TASKS && g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
-#endif
       g_frameLen = expectedTotal;
       g_frameSeq = curSeq;
+      frameComplete = true;
+    }
 #if RTL_HAS_FREERTOS
-      if (RTL_USE_TASKS && g_frameMutex) xSemaphoreGive(g_frameMutex);
+    if (RTL_USE_TASKS && g_frameMutex) xSemaphoreGive(g_frameMutex);
 #endif
+    if (frameComplete) {
       g_statFrames++;
       return true;
     }
@@ -510,31 +588,26 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
   return false;
 }
 
-static void attachControlCallbacks(WebsocketsClient& c) {
-  c.onMessage([&](WebsocketsClient& client, WebsocketsMessage msg) {
-    if (!msg.isText()) return;
-    const String s = msg.data();
-    // 그대로 S3로 전달
-    Serial1.println(s);
-  });
-
-  c.onEvent([&](WebsocketsClient& client, WebsocketsEvent ev, WSInterfaceString data) {
-    (void)data;
-    if (ev == WebsocketsEvent::ConnectionClosed) {
-      hasControlClient = false;
-      sendSafetyStopToS3();
-    }
-  });
+// MiniWS 콜백: 텍스트 메시지 → S3로 전달
+static void _onControlMsg(const String& msg) {
+  Serial1.println(msg);
+}
+// MiniWS 콜백: 연결 해제 → 안전 정지
+static void _onControlClose() {
+  hasControlClient = false;
+  sendSafetyStopToS3();
+}
+static void attachControlCallbacks(MiniWsClient& c) {
+  c.setCallbacks(_onControlMsg, _onControlClose);
 }
 
 #if ENABLE_CAMERA_BRIDGE
-static void attachCameraCallbacks(WebsocketsClient& c) {
-  c.onEvent([&](WebsocketsClient& client, WebsocketsEvent ev, WSInterfaceString data) {
-    (void)data;
-    if (ev == WebsocketsEvent::ConnectionClosed) {
-      hasCameraClient = false;
-    }
-  });
+// MiniWS 콜백: 카메라 연결 해제
+static void _onCameraClose() {
+  hasCameraClient = false;
+}
+static void attachCameraCallbacks(MiniWsClient& c) {
+  c.setCallbacks(nullptr, _onCameraClose);
 }
 #endif
 
@@ -543,19 +616,19 @@ void setup() {
   delay(200);
   Serial.println();
   Serial.println("[RTL] DeepCoRTL_Bridge boot");
-  Serial.printf("[RTL] Build: %s %s\n", __DATE__, __TIME__);
-  Serial.printf("[RTL] Compile detect: RTL_HAS_FREERTOS=%d, defaultTasks=%d\n",
+  RTL_PRINTF(Serial, "[RTL] Build: %s %s\n", __DATE__, __TIME__);
+  RTL_PRINTF(Serial, "[RTL] Compile detect: RTL_HAS_FREERTOS=%d, defaultTasks=%d\n",
                 (int)RTL_HAS_FREERTOS, (int)RTL_USE_TASKS);
-  Serial.printf("[RTL] Serial1 pins (fixed by variant): TX=%d(D4) RX=%d(D5)\n",
+  RTL_PRINTF(Serial, "[RTL] Serial1 pins (fixed by variant): TX=%d(AMB_D4) RX=%d(AMB_D5)\n",
                 RTL_LINK_TX_PIN, RTL_LINK_RX_PIN);
-  Serial.printf("[RTL] SPI pins (fixed by variant): SS=%d(D9) SCLK=%d(D10) MISO=%d(D11) MOSI=%d(D12)\n",
+  RTL_PRINTF(Serial, "[RTL] SPI pins (fixed by variant): SS=%d(AMB_D9) SCLK=%d(AMB_D10) MISO=%d(AMB_D11) MOSI=%d(AMB_D12)\n",
                 RTL_SPI_SS_PIN_DOC, RTL_SPI_SCLK_PIN_DOC, RTL_SPI_MISO_PIN_DOC, RTL_SPI_MOSI_PIN_DOC);
 
   // v0.1.5: S3 패스스루용 GPIO 초기화 (입력 모드 = S3가 자유롭게 사용)
 #if CFG_PASSTHRU_ENABLE
   pinMode(CFG_S3_EN_PIN, INPUT);
   pinMode(CFG_S3_BOOT_PIN, INPUT);
-  Serial.printf("[RTL] Passthru GPIO: S3_EN=%d(D6), S3_BOOT=%d(D7)\n",
+  RTL_PRINTF(Serial, "[RTL] Passthru GPIO: S3_EN=%d(AMB_D8/PA26), S3_BOOT=%d(AMB_D7/PA25)\n",
                 CFG_S3_EN_PIN, CFG_S3_BOOT_PIN);
 #endif
 
@@ -590,7 +663,7 @@ void setup() {
     g_apChannel = pickChannelFromMac();
   }
 
-  Serial.printf("[RTL] AP SSID=%s, Channel=%d\n", ssid, g_apChannel);
+  RTL_PRINTF(Serial, "[RTL] AP SSID=%s, Channel=%d\n", ssid, g_apChannel);
 
   int status = WiFi.apbegin(ssid, g_apPassword, g_apChannel);
   if (status != WL_CONNECTED) {
@@ -606,11 +679,11 @@ void setup() {
 
   // WebSocket servers — config.h
   wsControl.listen(CFG_WS_CONTROL_PORT);
-  Serial.printf("[RTL] WS control listening on :%d (/ws accepted)\n", CFG_WS_CONTROL_PORT);
+  RTL_PRINTF(Serial, "[RTL] WS control listening on :%d (/ws accepted)\n", CFG_WS_CONTROL_PORT);
 
 #if ENABLE_CAMERA_BRIDGE
   wsCamera.listen(CFG_WS_CAMERA_PORT);
-  Serial.printf("[RTL] WS camera listening on :%d (/ accepted)\n", CFG_WS_CAMERA_PORT);
+  RTL_PRINTF(Serial, "[RTL] WS camera listening on :%d (/ accepted)\n", CFG_WS_CAMERA_PORT);
 #else
   Serial.println("[RTL] Camera bridge disabled (ENABLE_CAMERA_BRIDGE=0)");
 #endif
@@ -631,7 +704,7 @@ static void acceptControlIfAny() {
   if (!wsControl.poll()) return;
   if (!wsControl.available()) return;
 
-  WebsocketsClient c = wsControl.accept();
+  MiniWsClient c = wsControl.accept();
   if (!c.available()) return;
 
   // single-client 정책: 기존 연결 종료
@@ -666,7 +739,7 @@ static void acceptCameraIfAny() {
   if (!wsCamera.poll()) return;
   if (!wsCamera.available()) return;
 
-  WebsocketsClient c = wsCamera.accept();
+  MiniWsClient c = wsCamera.accept();
   if (!c.available()) return;
 
   if (hasCameraClient && cameraClient.available()) {
@@ -699,34 +772,48 @@ static void pollCameraClient() {
 // @reboot            → RTL 재부팅
 // @info              → 현재 설정 출력
 // -----------------------------
-static bool g_needReboot = false;
+// volatile: pollUsbSerialCommands 콘텍스트에서 설정, @reboot 명령에서 읽기
+static volatile bool g_needReboot = false;
 
-static void handleSerialCommand(const String& cmd) {
-  if (cmd.startsWith("@set,channel,")) {
-    int ch = atoi(cmd.c_str() + 13);
-    if (ch > 0 && ch < 200) {
-      g_apChannel = ch;
-      g_needReboot = true;
-      Serial.printf("[RTL] Channel set to %d (reboot to apply: @reboot)\n", g_apChannel);
+// 토큰 기반 명령 파싱: 하드코딩 인덱스 제거, char* 직접 사용
+static void handleSerialCommand(const char* cmd) {
+  // @set,<key>,<value> — 쉼표 구분자로 토큰 분리
+  if (strncmp(cmd, "@set,", 5) == 0) {
+    const char* keyStart = cmd + 5;
+    const char* sep = strchr(keyStart, ',');
+    if (!sep) { Serial.println("[RTL] @set needs key,value"); return; }
+
+    size_t keyLen = (size_t)(sep - keyStart);
+    const char* val = sep + 1;
+
+    if (keyLen == 7 && strncmp(keyStart, "channel", 7) == 0) {
+      int ch = atoi(val);
+      if (ch > 0 && ch < 200) {
+        g_apChannel = ch;
+        g_needReboot = true;
+        RTL_PRINTF(Serial, "[RTL] Channel set to %d (reboot to apply: @reboot)\n", g_apChannel);
+      } else {
+        Serial.println("[RTL] Invalid channel");
+      }
+    } else if (keyLen == 8 && strncmp(keyStart, "password", 8) == 0) {
+      size_t pwLen = strlen(val);
+      if (pwLen >= 8 && pwLen < sizeof(g_apPassword)) {
+        strncpy(g_apPassword, val, sizeof(g_apPassword) - 1);
+        g_apPassword[sizeof(g_apPassword) - 1] = '\0';
+        g_needReboot = true;
+        RTL_PRINTF(Serial, "[RTL] Password set to '%s' (reboot to apply: @reboot)\n", g_apPassword);
+      } else {
+        Serial.println("[RTL] Password must be 8~31 chars");
+      }
     } else {
-      Serial.println("[RTL] Invalid channel");
+      RTL_PRINTF(Serial, "[RTL] Unknown @set key: %.*s\n", (int)keyLen, keyStart);
     }
-  } else if (cmd.startsWith("@set,password,")) {
-    String pw = cmd.substring(14);
-    if (pw.length() >= 8 && pw.length() < sizeof(g_apPassword)) {
-      strncpy(g_apPassword, pw.c_str(), sizeof(g_apPassword) - 1);
-      g_apPassword[sizeof(g_apPassword) - 1] = '\0';
-      g_needReboot = true;
-      Serial.printf("[RTL] Password set to '%s' (reboot to apply: @reboot)\n", g_apPassword);
-    } else {
-      Serial.println("[RTL] Password must be 8~31 chars");
-    }
-  } else if (cmd == "@reboot") {
+  } else if (strcmp(cmd, "@reboot") == 0) {
     Serial.println("[RTL] Rebooting...");
     delay(200);
     // AmebaD software reset
     NVIC_SystemReset();
-  } else if (cmd == "@diag") {
+  } else if (strcmp(cmd, "@diag") == 0) {
     // v0.1.3: 종합 진단 정보 출력 + WS 전달
     const uint32_t uptimeSec = millis() / 1000;
     const uint32_t uptimeMin = uptimeSec / 60;
@@ -761,18 +848,23 @@ static void handleSerialCommand(const String& cmd) {
     if (hasControlClient && controlClient.available()) {
       controlClient.send(diagBuf);
     }
-    Serial.printf("[RTL] Uptime: %lum %lus\n", (unsigned long)uptimeMin, (unsigned long)(uptimeSec % 60));
-  } else if (cmd.startsWith("@s3debug,")) {
+    RTL_PRINTF(Serial, "[RTL] Uptime: %lum %lus\n", (unsigned long)uptimeMin, (unsigned long)(uptimeSec % 60));
+  } else if (strncmp(cmd, "@s3debug,", 9) == 0) {
     // v0.1.3: S3 USB 디버그 토글 명령 전달
-    const char v = (cmd.length() >= 10) ? cmd.charAt(9) : '0';
-    Serial1.printf("@debug,%c\n", v);
-    Serial.printf("[RTL] Sent @debug,%c to S3\n", v);
-  } else if (cmd == "@info") {
-    Serial.printf("[RTL] Channel=%d (%s), Password='%s', IP=%s, SPI_HZ=%lu\n",
-                  g_apChannel,
-                  CFG_AP_CHANNEL_AUTO ? "auto/MAC" : "fixed",
-                  g_apPassword, WiFi.localIP().toString().c_str(), (unsigned long)SPI_HZ);
-    Serial.printf("[RTL] WS ctrl=%d, cam=%d, staCount=%d\n",
+    const char v = cmd[9] ? cmd[9] : '0';
+    RTL_PRINTF(Serial1, "@debug,%c\n", v);
+    RTL_PRINTF(Serial, "[RTL] Sent @debug,%c to S3\n", v);
+  } else if (strcmp(cmd, "@info") == 0) {
+    {
+      IPAddress ip = WiFi.localIP();
+      char ipStr[16];
+      snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+      RTL_PRINTF(Serial, "[RTL] Channel=%d (%s), Password='%s', IP=%s, SPI_HZ=%lu\n",
+                    g_apChannel,
+                    CFG_AP_CHANNEL_AUTO ? "auto/MAC" : "fixed",
+                    g_apPassword, ipStr, (unsigned long)SPI_HZ);
+    }
+    RTL_PRINTF(Serial, "[RTL] WS ctrl=%d, cam=%d, staCount=%d\n",
                   (int)hasControlClient,
 #if ENABLE_CAMERA_BRIDGE
                   (int)hasCameraClient,
@@ -781,20 +873,20 @@ static void handleSerialCommand(const String& cmd) {
 #endif
                   (int)g_ledStaCount);
 #if CFG_PASSTHRU_ENABLE
-    Serial.printf("[RTL] Passthru: enabled (S3_EN=%d, S3_BOOT=%d)\n",
+    RTL_PRINTF(Serial, "[RTL] Passthru: enabled (S3_EN=%d, S3_BOOT=%d)\n",
                   CFG_S3_EN_PIN, CFG_S3_BOOT_PIN);
 #else
     Serial.println("[RTL] Passthru: disabled");
 #endif
   }
 #if CFG_PASSTHRU_ENABLE
-  else if (cmd == "@passthru") {
+  else if (strcmp(cmd, "@passthru") == 0) {
     // v0.1.5: S3 패스스루 플래시 모드 진입
     startPassthruMode();
   }
 #endif
   else {
-    Serial.printf("[RTL] Unknown command: %s\n", cmd.c_str());
+    RTL_PRINTF(Serial, "[RTL] Unknown command: %s\n", cmd);
     Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @s3debug,0|1 / @diag / @reboot / @info"
 #if CFG_PASSTHRU_ENABLE
                    " / @passthru"
@@ -803,56 +895,61 @@ static void handleSerialCommand(const String& cmd) {
   }
 }
 
+// char[] 기반 USB 시리얼 명령 수신 (String 파편화 방지)
 static void pollUsbSerialCommands() {
-  static String usbLine;
+  static char usbBuf[128];
+  static size_t usbPos = 0;
   while (Serial.available()) {
     char ch = (char)Serial.read();
     if (ch == '\r') continue;
     if (ch == '\n') {
-      if (usbLine.length() > 0 && usbLine.charAt(0) == '@') {
-        handleSerialCommand(usbLine);
+      if (usbPos > 0 && usbBuf[0] == '@') {
+        usbBuf[usbPos] = '\0';
+        handleSerialCommand(usbBuf);
       }
-      usbLine = "";
+      usbPos = 0;
       continue;
     }
-    if (usbLine.length() < 128) usbLine += ch;
+    if (usbPos < sizeof(usbBuf) - 1) usbBuf[usbPos++] = ch;
   }
 }
 
 // S3 -> RTL 텍스트(선택): 디버그/상태를 WS로 되돌리고 싶으면 사용
+// char[] 기반 S3→RTL 텍스트 수신 (String 파편화 방지)
 static void pumpS3TextToWs() {
-  // 현재는 "줄 단위" 텍스트만 처리
-  static String line;
+  static char s3Buf[256];
+  static size_t s3Pos = 0;
   while (Serial1.available()) {
     char ch = (char)Serial1.read();
     if (ch == '\r') continue;
     if (ch == '\n') {
-      if (line.length() > 0) {
+      if (s3Pos > 0) {
+        s3Buf[s3Pos] = '\0';
         // 로그 전용 채널: S3가 "@log,"로 보내면 RTL USB 콘솔에 출력
-        if (line.startsWith("@log,")) {
+        if (strncmp(s3Buf, "@log,", 5) == 0) {
           Serial.print("[S3] ");
-          Serial.println(line.substring(5));
+          Serial.println(s3Buf + 5);
         }
         // v0.1.2: 에러 전파 — S3가 "@err,"로 보내면 USB콘솔 + WS로 중계
-        else if (line.startsWith("@err,")) {
+        else if (strncmp(s3Buf, "@err,", 5) == 0) {
           Serial.print("[S3][ERR] ");
-          Serial.println(line.substring(5));
+          Serial.println(s3Buf + 5);
           if (hasControlClient && controlClient.available()) {
-            controlClient.send(line.c_str());  // PC에 "@err,코드,메시지" 그대로 전달
+            controlClient.send(s3Buf);  // PC에 "@err,코드,메시지" 그대로 전달
           }
         } else {
           // 그 외 텍스트는 (선택) WS control로 echo
           if (hasControlClient && controlClient.available()) {
-            controlClient.send(line.c_str());
+            controlClient.send(s3Buf);
           }
         }
-        line = "";
       }
+      s3Pos = 0;
       continue;
     }
     // binary 혼입 방지용 제한
     if ((uint8_t)ch >= 0x20 || ch == '\t') {
-      if (line.length() < 256) line += ch;
+      if (s3Pos < sizeof(s3Buf) - 1) s3Buf[s3Pos++] = ch;
     }
   }
 }
@@ -901,18 +998,14 @@ void loop() {
   static uint32_t lastStatMs = 0;
   if (nowMs - lastStatMs >= CFG_STAT_INTERVAL_MS) {
     lastStatMs = nowMs;
+    uint32_t sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs;
+    SNAPSHOT_AND_RESET_STATS(sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs);
     const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
-    const float fps = (float)g_statFrames / secs;
-    const float kbps = ((float)g_statBytes / 1024.0f) / secs;
-    Serial.printf("[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu\n",
-                  fps, (unsigned long)g_statBlocks, kbps,
-                  (unsigned long)g_statSyncErrors, (unsigned long)g_statSeqErrors, (unsigned long)g_statOversize);
-    g_statBlocks = 0;
-    g_statFrames = 0;
-    g_statBytes = 0;
-    g_statSyncErrors = 0;
-    g_statSeqErrors = 0;
-    g_statOversize = 0;
+    const float fps = (float)sFrm / secs;
+    const float kbps = ((float)sByt / 1024.0f) / secs;
+    RTL_PRINTF(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu\n",
+                  fps, (unsigned long)sBlk, kbps,
+                  (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs);
   }
 #endif
 
@@ -962,18 +1055,14 @@ static void taskWsUart(void* arg) {
     const uint32_t nowMs = millis();
     if (nowMs - lastStatMs >= CFG_STAT_INTERVAL_MS) {
       lastStatMs = nowMs;
+      uint32_t sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs;
+      SNAPSHOT_AND_RESET_STATS(sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs);
       const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
-      const float fps = (float)g_statFrames / secs;
-      const float kbps = ((float)g_statBytes / 1024.0f) / secs;
-      Serial.printf("[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu\n",
-                    fps, (unsigned long)g_statBlocks, kbps,
-                    (unsigned long)g_statSyncErrors, (unsigned long)g_statSeqErrors, (unsigned long)g_statOversize);
-      g_statBlocks = 0;
-      g_statFrames = 0;
-      g_statBytes = 0;
-      g_statSyncErrors = 0;
-      g_statSeqErrors = 0;
-      g_statOversize = 0;
+      const float fps = (float)sFrm / secs;
+      const float kbps = ((float)sByt / 1024.0f) / secs;
+      RTL_PRINTF(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu\n",
+                    fps, (unsigned long)sBlk, kbps,
+                    (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs);
     }
 #endif
 
@@ -984,7 +1073,7 @@ static void taskWsUart(void* arg) {
     const uint32_t nowBeat = millis();
     if (nowBeat - lastBeatMs >= 5000) {
       lastBeatMs = nowBeat;
-      Serial.printf("[RTL][TASK] ws_uart alive (wantStream=%d)\n", (int)g_wantStream);
+      RTL_PRINTF(Serial, "[RTL][TASK] ws_uart alive (wantStream=%d)\n", (int)g_wantStream);
     }
 
     // WS/UART은 응답성이 중요: 짧게 양보
@@ -1013,7 +1102,7 @@ static void taskSpiPull(void* arg) {
     const uint32_t nowBeat = millis();
     if (nowBeat - lastBeatMs >= 5000) {
       lastBeatMs = nowBeat;
-      Serial.printf("[RTL][TASK] spi_pull alive (seq=%u len=%u)\n",
+      RTL_PRINTF(Serial, "[RTL][TASK] spi_pull alive (seq=%u len=%u)\n",
                     (unsigned)g_frameSeq, (unsigned)g_frameLen);
     }
 #else
@@ -1041,7 +1130,7 @@ static void ensureTasksStartedOnce() {
     Serial.println("[RTL] Runtime: tasks started OK (ws_uart + spi_pull)");
   } else {
     g_tasksEnabledRuntime = false;
-    Serial.printf("[RTL] Runtime: task create FAILED (ws_uart=%d spi_pull=%d) -> falling back to loop()\n",
+    RTL_PRINTF(Serial, "[RTL] Runtime: task create FAILED (ws_uart=%d spi_pull=%d) -> falling back to loop()\n",
                   (int)okA, (int)okB);
   }
 }

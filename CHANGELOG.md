@@ -5,7 +5,76 @@
 
 ---
 
-## [v0.1.5] — 2026-02-11 — 옵션 E (RTL 하이브리드) 패스스루 플래시 구현
+## [v0.1.6] — 2026-02-11 — 동시성 안전 + 메모리 안정성 + 프로토콜 강화
+
+### 배경
+- RTL8720DN 펌웨어 코드 리뷰에서 High 4건 / Medium 4건 / Low 1건의 개선점 도출
+- RTOS 멀티태스크 환경에서의 레이스 컨디션, String 힙 파편화, WS 프로토콜 검증 부족 등을 체계적으로 수정
+
+### High (안정성)
+- **RTL_PRINTF 전역 버퍼 동시 접근 제거** (`DeepCoRTL_Bridge.ino`)
+  - `static char _rtl_pf[256]` 전역 버퍼 → 매크로 내 `char _pf[192]` 스택 로컬 버퍼
+  - taskWsUart / taskSpiPull 동시 호출 시 로그 문자열 깨짐 방지
+
+- **프레임 버퍼 쓰기/읽기 동기화 범위 확장** (`DeepCoRTL_Bridge.ino`)
+  - `memcpy(g_frameBuf + offset, ...)` 구간까지 g_frameMutex 보호 확장
+  - 기존: g_frameLen/g_frameSeq만 mutex 보호 → 개선: memcpy + 메타데이터 갱신 원자적 보호
+  - WS sendBinary 중 SPI 쓰기가 프레임을 덮어쓰는 레이스 제거
+
+- **MiniWS 헤더 라인 무제한 누적 방지** (`MiniWS.h`)
+  - `_readLine()`: String → char buf[256] 고정 버퍼, 상한 초과 시 handshake 거부
+  - 악성/오류 클라이언트의 무한 헤더로 인한 힙 압박 방지
+
+- **String 중심 처리 → char[] 전환** (`MiniWS.h`, `DeepCoRTL_Bridge.ino`)
+  - WS handshake(`_doHandshake`): String → char[] 기반 헤더 파싱
+  - WS text frame(`_readFrame`): char[] 버퍼로 수신 후 콜백 시에만 최소 String 생성
+  - USB 시리얼 수신(`pollUsbSerialCommands`): `static String usbLine` → `static char usbBuf[128]`
+  - S3→RTL 텍스트 수신(`pumpS3TextToWs`): `static String line` → `static char s3Buf[256]`
+  - RTL8720DN 제한 메모리에서 장시간 운영 시 힙 파편화 위험 대폭 감소
+
+### Medium (안정성·보안)
+- **WS handshake 프로토콜 검증 강화** (`MiniWS.h`)
+  - `Upgrade: websocket` + `Connection: Upgrade` 필수 헤더 검증 추가 (case-insensitive)
+  - 기존: Sec-WebSocket-Key만 확인 → 개선: 3가지 필수 헤더 모두 검증
+  - 비정상 HTTP 요청 수용 방지
+
+- **통계 변수 동시 접근 보호** (`DeepCoRTL_Bridge.ino`)
+  - `SNAPSHOT_AND_RESET_STATS` 매크로: taskENTER_CRITICAL 임계구역에서 원자적 복사+리셋
+  - 기존: 읽기와 리셋 사이에 다른 태스크가 값 변경 가능 → 개선: 6개 변수 일괄 스냅샷
+  - stat 변수에 volatile 추가
+
+- **상태 플래그 volatile 일관성 확보** (`DeepCoRTL_Bridge.ino`)
+  - `hasControlClient`, `hasCameraClient`, `g_needReboot` → volatile 추가
+  - 태스크 간 가시성 보장 + 접근 규칙 주석 문서화
+
+- **패스스루 모드 강제 탈출 경로 추가** (`DeepCoRTL_Bridge.ino`)
+  - Ctrl+C(0x03) x 3회를 500ms 이내 입력 시 즉시 탈출
+  - 기존: 무통신 타임아웃(10초)만 → 개선: 사용자가 즉시 빠져나올 수 있음
+
+### Low (유지보수성)
+- **명령 파싱 하드코딩 인덱스 제거** (`DeepCoRTL_Bridge.ino`)
+  - `handleSerialCommand(const String&)` → `handleSerialCommand(const char*)`
+  - `cmd.c_str() + 13`, `cmd.substring(14)` 등 매직 인덱스 → `strchr()` 구분자 탐색 + `strncmp()` 토큰 매칭
+  - `@set,<key>,<value>` 명령의 key/value 분리를 구분자 기반으로 변경
+  - 새로운 @set 서브명령 추가 시 유지보수 용이
+
+### 변경 파일
+- `rtl8720dn/DeepCoRTL_Bridge/MiniWS.h` — v2 전면 개선 (String→char[], 헤더검증, 라인상한)
+  - `_readLine()`: char buf + 길이 상한
+  - `_doHandshake()`: char[] 기반 + Upgrade/Connection 검증
+  - `_readFrame()` text: char[] 수신 후 최소 String 콜백
+  - case-insensitive 헬퍼 함수 추가 (`_ws_lower`, `_ws_prefixEq`, `_ws_containsEq`, `_ws_trimEnd`)
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — 동시성/메모리/파싱 전면 개선
+  - RTL_PRINTF 매크로: 스택 로컬 버퍼
+  - 프레임 memcpy mutex 확장
+  - SNAPSHOT_AND_RESET_STATS 매크로 (Arduino IDE 전처리기 호환)
+  - volatile 플래그 일관성
+  - 패스스루 Ctrl+C x3 탈출
+  - handleSerialCommand/pollUsbSerialCommands/pumpS3TextToWs char[] 전환
+
+---
+
+## [v0.1.5] — 2026-02-11 — 옵션 E 패스스루 + BW16 타겟 컴파일 수정
 
 ### 기능
 - **S3 패스스루 플래시 모드** (`config.h`, `DeepCoRTL_Bridge.ino`)
@@ -18,6 +87,23 @@
   - `CFG_PASSTHRU_ENABLE = 1` (기본 활성화)
   - `@info` 명령에 패스스루 GPIO 핀 정보 표시 추가
 
+### BW16 (RTL8720DN) 타겟 컴파일 수정
+- **핀 매핑 수정** (`config.h`, `DeepCoRTL_Bridge.ino`)
+  - BW16 variant.h에 맞게 `D0`~`D12` → `AMB_D0`~`AMB_D12` 전면 변경
+  - config.h 핀 정의와 주석 일괄 수정 (PA26→AMB_D8, PA25→AMB_D7 등)
+- **MiniWS.h 신규 작성** — 커스텀 WebSocket 서버/클라이언트
+  - 외부 라이브러리(WebSockets2_Generic) 비호환 → Ameba 내장 WiFiServer/WiFiClient만 사용
+  - SHA-1, Base64 자체 구현 (mbedtls 링크 불필요)
+  - Text/Binary 메시지, Ping/Pong, Close 프레임 처리
+- **RTL_PRINTF 매크로 도입** (`DeepCoRTL_Bridge.ino`)
+  - `LOGUARTClass`/`UARTClassTwo`에 `printf()` 없음 → snprintf+print 에뮬레이션
+- **IPAddress::toString() 미지원 우회** — 수동 IP 포맷팅
+- **프레임 버퍼 128KB → 8KB** (`config.h`)
+  - RTL8720DN RAM 한계로 인한 링커 오버플로우(BD_RAM_NS) 해결
+- **`#undef min` / `#undef max`** — Ameba SDK 매크로 충돌 해결
+- **`hdrLooksOk` → 매크로 전환** — Arduino IDE 전처리기 자동 프로토타입 이슈 우회
+- **partitions.csv 한글 주석 → 영문** — gen_esp32part.py UnicodeDecodeError 해결
+
 ### 문서
 - **듀얼칩설계전략및펌웨어업그레이드방법.md** 업데이트
   - 옵션 E (RTL 하이브리드) 섹션 추가 (1.6)
@@ -27,11 +113,10 @@
   - 보드 설계 요구사항을 공통/옵션별로 분리 (3.4)
 
 ### 변경 파일
-- `rtl8720dn/DeepCoRTL_Bridge/config.h` — 패스스루 GPIO 핀/타임아웃/보드레이트 설정 추가 (+18줄)
-- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — 패스스루 모드 전체 구현 (~130줄)
-  - `enterS3BootMode()` / `resetS3Normal()` / `runPassthruBridge()` / `startPassthruMode()`
-  - `@passthru` 명령 핸들러 추가
-  - setup()에 GPIO 초기화 추가
+- `rtl8720dn/DeepCoRTL_Bridge/MiniWS.h` — **신규**: 커스텀 WebSocket 구현 (445줄)
+- `rtl8720dn/DeepCoRTL_Bridge/config.h` — 핀 매핑 수정 + 패스스루 설정 + 프레임 버퍼 축소
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — MiniWS 통합 + 핀 매핑 + RTL_PRINTF + 패스스루
+- `esp32s3/DeepCoS3_Robot/partitions.csv` — 한글 주석 → 영문
 - `듀얼칩설계전략및펌웨어업그레이드방법.md` — 옵션 E 전체 추가 (+110줄)
 
 ---

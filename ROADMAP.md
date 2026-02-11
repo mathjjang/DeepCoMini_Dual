@@ -72,7 +72,7 @@
 
 ---
 
-## v0.1.5 — 옵션 E (RTL 하이브리드) 패스스루 구현
+## v0.1.5 — 옵션 E 패스스루 + BW16 타겟 컴파일 수정
 
 - [x] S3 패스스루 플래시 모드 (`@passthru` 명령)
   - RTL이 GPIO로 S3 BOOT/EN 제어 → 부트모드 진입
@@ -80,6 +80,25 @@
   - 무통신 타임아웃 자동 종료 + S3 정상 리셋
 - [x] config.h에 패스스루 GPIO/타임아웃 설정 추가
 - [x] 옵션 E 문서 (설계전략, 비교표, 펌웨어 업그레이드) 업데이트
+- [x] BW16 핀 매핑 수정 (D0~D12 → AMB_D0~AMB_D12)
+- [x] MiniWS.h 커스텀 WebSocket 구현 (외부 라이브러리 비호환 대체)
+- [x] RTL_PRINTF 매크로 (printf 미지원 우회)
+- [x] 프레임 버퍼 128KB → 8KB (RAM 오버플로우 해결)
+- [x] partitions.csv 한글→영문 (UnicodeDecodeError 해결)
+
+---
+
+## v0.1.6 — 동시성 안전 + 메모리 안정성 + 프로토콜 강화
+
+- [x] RTL_PRINTF 전역 버퍼 → 스택 로컬 버퍼 (태스크 동시 접근 제거)
+- [x] 프레임 버퍼 memcpy 구간까지 mutex 보호 확장 (JPEG 깨짐 방지)
+- [x] MiniWS _readLine() 라인 길이 상한 256B (무한 헤더 방지)
+- [x] String → char[] 전환 (WS handshake, readFrame, 시리얼 파서, S3 텍스트 펌프)
+- [x] WS handshake: Upgrade + Connection 필수 헤더 검증 추가
+- [x] 통계 변수: SNAPSHOT_AND_RESET_STATS 매크로 (임계구역 원자적 복사+리셋)
+- [x] 상태 플래그 volatile 일관성 (hasControlClient, hasCameraClient, g_needReboot)
+- [x] 패스스루 Ctrl+C x3 강제 탈출 경로 추가
+- [x] 명령 파싱: 매직 인덱스 → strchr/strncmp 토큰 기반 변경
 
 ---
 
@@ -110,3 +129,4 @@
 | v0.1.3 | 2026-02-09 | 디버그 토글, @diag 명령, 연결 시간 추적 |
 | v0.1.4 | 2026-02-09 | MAC 기반 채널 자동 분산, 듀얼칩 설계전략 문서 |
 | v0.1.5 | 2026-02-11 | 옵션 E: S3 패스스루 플래시, @passthru 명령 |
+| v0.1.6 | 2026-02-11 | 동시성 안전, 메모리 안정성, WS 프로토콜 강화 |

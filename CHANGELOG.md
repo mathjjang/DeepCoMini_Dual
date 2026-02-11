@@ -56,6 +56,77 @@
 
 ---
 
+## [v0.1.9] — 2026-02-11 — WebSocket OTA (RTL 자체 + S3 SPI OTA)
+
+### 배경
+- Wi-Fi OTA로 펌웨어 업데이트를 가능하게 하여, USB 직접 연결 없이 무선 업그레이드 지원
+- RTL8720DN: AmebaD Flash API를 사용한 듀얼 OTA 파티션 직접 기록 방식
+- ESP32-S3: RTL이 WebSocket으로 수신한 바이너리를 SPI로 S3에 전달, S3가 `Update.h`로 자체 기록
+- 초기에는 S3 OTA를 UART로 계획했으나, SPI(30MHz)가 UART(115200bps) 대비 ~16배 빠른 속도 이점으로 SPI 방식 채택
+
+### RTL 자체 OTA (DeepCoRTL_Bridge.ino)
+- **Flash API 직접 사용** (`flash_api.h`, `sys_api.h`)
+  - `flash_read_word`, `flash_erase_sector`, `flash_stream_write`, `flash_write_word`
+  - 듀얼 OTA 주소: `OTA_ADDR_1 = 0x006000`, `OTA_ADDR_2 = 0x106000` (최대 1MB)
+  - 부트로더 서명 검증: `0x35393138` / `0x31313738`
+- **OTA 상태 관리** (`g_ota` 구조체)
+  - `otaChooseAddress()`: 현재 부팅 이미지 감지 → 반대쪽에 기록
+  - `otaEraseFlash()`: 이미지 크기만큼 섹터 삭제
+  - `otaWriteChunk()`: WS binary [offset(4BE)+len(4BE)+payload] 파싱 → Flash 기록 + 체크섬 누적
+  - `otaEnd()`: 크기/체크섬 검증 → 서명 기록 → 기존 이미지 무효화 → 2초 후 `sys_reset()`
+  - `otaCancel()`: 새 이미지 무효화 + 기존 복원
+
+### S3 SPI OTA (RTL→S3)
+- **RTL 측** (`DeepCoRTL_Bridge.ino`)
+  - `g_otaS3` 상태 구조체 + `spiOtaTransfer()`, `spiCheckS3Ack()`, `spiSendOtaBlock()`
+  - `otaS3Begin()`: 안전 정지 → 카메라 OFF → SPI START 블록 전송
+  - `otaS3WriteChunk()`: WS binary → SPI 블록 크기로 분할 → SPI_TYPE_OTA 전송
+  - `otaS3End()`: END 블록 전송 → S3 최종 ACK 확인
+  - `otaS3Cancel()`: ERR 플래그 END 전송
+- **S3 측** (`DeepCoS3_Robot.ino`)
+  - `#include <Update.h>` 추가
+  - `g_s3Ota` 상태 구조체
+  - `handleSpiOtaBlock()`: SPI RX에서 OTA 데이터 감지 → `Update.begin/write/end` 호출
+  - `fillOtaAckBlock()`: SPI TX에 ACK 응답 적재 (에러 플래그 포함)
+  - `spiSlavePoll()`: `SPI_TYPE_OTA` 감지 시 OTA 핸들러 호출
+  - OTA 성공 후 2초 지연 `ESP.restart()`
+
+### SPI 프로토콜 확장 (dcm_spi_protocol.h)
+- `SPI_TYPE_OTA = 2` — OTA 데이터 블록
+- `SPI_TYPE_OTA_ACK = 3` — S3 응답 블록
+- `SPI_FLAG_OTA_ERR = 0x04` — OTA 에러 플래그
+
+### WebSocket OTA 프로토콜
+- `@ota,start,rtl,<size>` → RTL 자체 OTA 시작
+- `@ota,start,s3,<size>` → S3 SPI OTA 시작
+- `@ota,end,<size>` → OTA 완료 (대상 자동 판별)
+- `@ota,cancel` → OTA 취소
+- WS binary: `[offset(4BE) + length(4BE) + payload]` 청크 포맷
+
+### OTA 테스트 UI
+- **`upload_test/mini_dual_firmware_upload.html`** 신규
+  - RTL/S3 대상 선택, 파일 업로드, 진행률 표시
+  - WebSocket 전용 (HTTP 제거)
+- **`upload_test/OTA_TASKS.md`** 신규 — OTA 구현 단계 체크리스트
+
+### 설계 문서 업데이트
+- **`듀얼칩설계전략및펌웨어업그레이드방법.md`** 수정
+  - Section 2.5: S3 펌웨어 업그레이드 → SPI OTA 방식으로 갱신
+  - Section 3.2: Phase 2 + Phase 3 통합 (UART OTA 생략, SPI OTA 직행)
+  - ASCII 다이어그램 및 구현 노트 갱신
+
+### 변경 파일
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — RTL OTA + S3 SPI OTA 전체 구현 (+500줄)
+- `rtl8720dn/DeepCoRTL_Bridge/config.h` — 버전 0.1.9
+- `esp32s3/DeepCoS3_Robot/DeepCoS3_Robot.ino` — SPI OTA 수신기 + Update.h 연동 (+150줄)
+- `esp32s3/DeepCoS3_Robot/config.h` — 버전 0.1.9
+- `shared/dcm_spi_protocol.h` — OTA 타입/플래그 상수 추가
+- **신규**: `upload_test/mini_dual_firmware_upload.html` — OTA 테스트 UI
+- **신규**: `upload_test/OTA_TASKS.md` — OTA 구현 체크리스트
+- `듀얼칩설계전략및펌웨어업그레이드방법.md` — SPI OTA 반영
+
+---
+
 ## [v0.1.8] — 2026-02-11 — SPI CRC16 무결성 + S3 안전성 강화 + 코드 품질 개선
 
 ### 배경

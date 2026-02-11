@@ -5,6 +5,37 @@
 
 ---
 
+## [v0.1.5] — 2026-02-11 — 옵션 E (RTL 하이브리드) 패스스루 플래시 구현
+
+### 기능
+- **S3 패스스루 플래시 모드** (`config.h`, `DeepCoRTL_Bridge.ino`)
+  - 옵션 E (RTL 하이브리드) 구현: USB-C → RTL, RTL이 S3 플래시 대행
+  - `@passthru` 시리얼 명령으로 패스스루 모드 진입
+  - RTL이 GPIO 2개로 S3의 BOOT/EN 핀 제어 → 부트모드 진입
+  - USB↔UART 투명 브릿지 루프: PC의 esptool이 RTL을 경유하여 S3 직접 플래시
+  - 무통신 타임아웃(10초)으로 자동 정상 모드 복귀
+  - 완료 후 S3 자동 정상 부트 리셋
+  - `CFG_PASSTHRU_ENABLE = 1` (기본 활성화)
+  - `@info` 명령에 패스스루 GPIO 핀 정보 표시 추가
+
+### 문서
+- **듀얼칩설계전략및펌웨어업그레이드방법.md** 업데이트
+  - 옵션 E (RTL 하이브리드) 섹션 추가 (1.6)
+  - 종합 비교표에 E 열 추가 + "단일 실패점" 행 추가 (1.7)
+  - 옵션 E 펌웨어 업그레이드 방법 섹션 추가 (2.5)
+  - 추천 설계를 D/E 상황별 비교로 확장 (3.1)
+  - 보드 설계 요구사항을 공통/옵션별로 분리 (3.4)
+
+### 변경 파일
+- `rtl8720dn/DeepCoRTL_Bridge/config.h` — 패스스루 GPIO 핀/타임아웃/보드레이트 설정 추가 (+18줄)
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — 패스스루 모드 전체 구현 (~130줄)
+  - `enterS3BootMode()` / `resetS3Normal()` / `runPassthruBridge()` / `startPassthruMode()`
+  - `@passthru` 명령 핸들러 추가
+  - setup()에 GPIO 초기화 추가
+- `듀얼칩설계전략및펌웨어업그레이드방법.md` — 옵션 E 전체 추가 (+110줄)
+
+---
+
 ## [v0.1.4] — 2026-02-09 — 교실 다수 로봇 채널 분산 + 설계 문서
 
 ### 기능

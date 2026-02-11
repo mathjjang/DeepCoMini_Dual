@@ -1,6 +1,7 @@
 /*
   config.h — RTL8720DN (DeepCoRTL_Bridge) 설정 파일
   v0.1.1: 하드코딩된 핀/파라미터를 한 곳에서 관리
+  v0.1.5: 옵션 E (RTL 하이브리드) — S3 패스스루 플래시 GPIO 추가
 
   Wi-Fi 채널/비밀번호는 시리얼 명령으로도 변경 가능 (v0.1.1+)
 */
@@ -46,6 +47,27 @@
 #define CFG_AP_DNS_B  8
 #define CFG_AP_DNS_C  8
 #define CFG_AP_DNS_D  8
+
+// =============================================
+// 옵션 E: S3 패스스루 플래시 (RTL 하이브리드)
+// RTL이 S3의 BOOT/EN을 GPIO로 제어하여 부트모드 진입 후
+// USB↔UART 투명 브릿지(패스스루)로 esptool이 S3를 직접 플래시
+// =============================================
+// 1 = 패스스루 기능 활성화, 0 = 비활성화
+#define CFG_PASSTHRU_ENABLE     1
+
+// RTL GPIO → S3 핀 연결 (보드 배선에 맞게 수정)
+// BW16 사용 가능 GPIO: D0(PB0), D1(PB3), D6(PA26), D7(PA25), D8(PA27)
+// (D4/D5는 Serial1, D9~D12는 SPI에 사용 중)
+#define CFG_S3_EN_PIN           D6    // PA26 → S3 EN (RESET)
+#define CFG_S3_BOOT_PIN         D7    // PA25 → S3 GPIO0 (BOOT)
+
+// 패스스루 UART 보드레이트 (esptool 기본값)
+#define CFG_PASSTHRU_BAUD       115200
+
+// 패스스루 자동 종료 타임아웃 (ms)
+// esptool 통신이 이 시간 동안 없으면 정상 모드로 복귀
+#define CFG_PASSTHRU_TIMEOUT_MS 10000
 
 // =============================================
 // UART 링크 (RTL ↔ S3)

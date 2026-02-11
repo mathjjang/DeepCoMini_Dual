@@ -139,6 +139,146 @@ static void sendSafetyStopToS3() {
   Serial1.println("stop,100");
 }
 
+// =============================================================
+// v0.1.5: 옵션 E — S3 패스스루 플래시 모드 (RTL 하이브리드)
+//
+// 동작 흐름:
+//   1. USB에서 "@passthru" 명령 수신
+//   2. RTL이 GPIO로 S3를 부트모드로 전환 (BOOT=LOW → EN 리셋)
+//   3. USB↔UART 투명 브릿지 루프 진입
+//      (PC의 esptool ↔ RTL USB ↔ RTL UART ↔ S3 부트로더)
+//   4. 타임아웃(무통신 10초) 또는 플래시 완료 시 정상 모드 복귀
+//   5. S3를 정상 부트로 리셋
+// =============================================================
+#if CFG_PASSTHRU_ENABLE
+
+static volatile bool g_passthruActive = false;
+
+// S3를 부트모드로 전환 (GPIO0=LOW 상태에서 EN 리셋)
+static void enterS3BootMode() {
+  pinMode(CFG_S3_BOOT_PIN, OUTPUT);
+  pinMode(CFG_S3_EN_PIN, OUTPUT);
+
+  // Step 1: GPIO0 = LOW (부트모드 선택)
+  digitalWrite(CFG_S3_BOOT_PIN, LOW);
+  delay(10);
+
+  // Step 2: EN = LOW → HIGH (리셋)
+  digitalWrite(CFG_S3_EN_PIN, LOW);
+  delay(50);
+  digitalWrite(CFG_S3_EN_PIN, HIGH);
+  delay(50);
+
+  Serial.println("[RTL] S3 entered BOOT mode (GPIO0=LOW, EN toggled)");
+}
+
+// S3를 정상 모드로 리셋 (GPIO0=HIGH 상태에서 EN 리셋)
+static void resetS3Normal() {
+  // Step 1: GPIO0 = HIGH (정상 부트 선택)
+  digitalWrite(CFG_S3_BOOT_PIN, HIGH);
+  delay(10);
+
+  // Step 2: EN = LOW → HIGH (리셋)
+  digitalWrite(CFG_S3_EN_PIN, LOW);
+  delay(50);
+  digitalWrite(CFG_S3_EN_PIN, HIGH);
+  delay(100);
+
+  // GPIO를 입력으로 전환 (S3가 자유롭게 사용하도록)
+  pinMode(CFG_S3_BOOT_PIN, INPUT);
+  pinMode(CFG_S3_EN_PIN, INPUT);
+
+  Serial.println("[RTL] S3 reset to NORMAL mode");
+}
+
+// USB↔UART 투명 브릿지 루프
+// esptool은 115200~921600 보드레이트를 사용할 수 있음
+// 기본 115200으로 시작, esptool이 change_baud 시 UART도 변경 필요
+// (현재는 고정 보드레이트, 향후 자동 감지 가능)
+static void runPassthruBridge() {
+  Serial.println("[RTL] === PASSTHRU MODE START ===");
+  Serial.println("[RTL] USB <-> UART transparent bridge active");
+  Serial.printf("[RTL] Timeout: %d ms (no data = exit)\n", CFG_PASSTHRU_TIMEOUT_MS);
+
+  g_passthruActive = true;
+
+  // UART 보드레이트를 패스스루용으로 설정
+  // (이미 CFG_LINK_BAUD와 같으면 재설정 불필요하지만 명시적으로)
+  Serial1.end();
+  Serial1.begin(CFG_PASSTHRU_BAUD);
+
+  unsigned long lastDataTime = millis();
+  uint8_t buf[256];
+
+  while (g_passthruActive) {
+    bool hadData = false;
+
+    // USB → UART (PC esptool → S3 부트로더)
+    int avail = Serial.available();
+    if (avail > 0) {
+      int toRead = (avail > (int)sizeof(buf)) ? (int)sizeof(buf) : avail;
+      int n = Serial.readBytes(buf, toRead);
+      if (n > 0) {
+        Serial1.write(buf, n);
+        hadData = true;
+      }
+    }
+
+    // UART → USB (S3 부트로더 → PC esptool)
+    avail = Serial1.available();
+    if (avail > 0) {
+      int toRead = (avail > (int)sizeof(buf)) ? (int)sizeof(buf) : avail;
+      int n = Serial1.readBytes(buf, toRead);
+      if (n > 0) {
+        Serial.write(buf, n);
+        hadData = true;
+      }
+    }
+
+    if (hadData) {
+      lastDataTime = millis();
+    }
+
+    // 타임아웃 체크
+    if (millis() - lastDataTime > CFG_PASSTHRU_TIMEOUT_MS) {
+      Serial.println("\n[RTL] Passthru timeout - no data, exiting");
+      break;
+    }
+
+    // 최소 지연 (CPU 점유 방지)
+    delay(1);
+  }
+
+  g_passthruActive = false;
+
+  // UART를 원래 보드레이트로 복원
+  Serial1.end();
+  Serial1.begin(CFG_LINK_BAUD);
+
+  Serial.println("[RTL] === PASSTHRU MODE END ===");
+}
+
+// 패스스루 전체 시퀀스 실행
+static void startPassthruMode() {
+  Serial.println("[RTL] ========================================");
+  Serial.println("[RTL] S3 Flash Passthrough Mode (Option E)");
+  Serial.println("[RTL] ========================================");
+  Serial.println("[RTL] 1. Entering S3 boot mode...");
+  enterS3BootMode();
+
+  Serial.println("[RTL] 2. Starting USB<->UART bridge...");
+  Serial.println("[RTL] >>> Use esptool / Arduino IDE to flash S3 now <<<");
+  runPassthruBridge();
+
+  Serial.println("[RTL] 3. Resetting S3 to normal mode...");
+  resetS3Normal();
+
+  Serial.println("[RTL] Passthru complete. Resuming normal operation.");
+  Serial.println("[RTL] ========================================");
+}
+
+#endif // CFG_PASSTHRU_ENABLE
+
 // -----------------------------
 // WebSocket servers
 // -----------------------------
@@ -411,6 +551,14 @@ void setup() {
   Serial.printf("[RTL] SPI pins (fixed by variant): SS=%d(D9) SCLK=%d(D10) MISO=%d(D11) MOSI=%d(D12)\n",
                 RTL_SPI_SS_PIN_DOC, RTL_SPI_SCLK_PIN_DOC, RTL_SPI_MISO_PIN_DOC, RTL_SPI_MOSI_PIN_DOC);
 
+  // v0.1.5: S3 패스스루용 GPIO 초기화 (입력 모드 = S3가 자유롭게 사용)
+#if CFG_PASSTHRU_ENABLE
+  pinMode(CFG_S3_EN_PIN, INPUT);
+  pinMode(CFG_S3_BOOT_PIN, INPUT);
+  Serial.printf("[RTL] Passthru GPIO: S3_EN=%d(D6), S3_BOOT=%d(D7)\n",
+                CFG_S3_EN_PIN, CFG_S3_BOOT_PIN);
+#endif
+
   // UART to S3
   Serial1.begin(LINK_BAUD);
 
@@ -632,9 +780,26 @@ static void handleSerialCommand(const String& cmd) {
                   0,
 #endif
                   (int)g_ledStaCount);
-  } else {
+#if CFG_PASSTHRU_ENABLE
+    Serial.printf("[RTL] Passthru: enabled (S3_EN=%d, S3_BOOT=%d)\n",
+                  CFG_S3_EN_PIN, CFG_S3_BOOT_PIN);
+#else
+    Serial.println("[RTL] Passthru: disabled");
+#endif
+  }
+#if CFG_PASSTHRU_ENABLE
+  else if (cmd == "@passthru") {
+    // v0.1.5: S3 패스스루 플래시 모드 진입
+    startPassthruMode();
+  }
+#endif
+  else {
     Serial.printf("[RTL] Unknown command: %s\n", cmd.c_str());
-    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @s3debug,0|1 / @diag / @reboot / @info");
+    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @s3debug,0|1 / @diag / @reboot / @info"
+#if CFG_PASSTHRU_ENABLE
+                   " / @passthru"
+#endif
+    );
   }
 }
 

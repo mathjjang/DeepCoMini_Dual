@@ -1,13 +1,13 @@
-# DeepCoS3_Robot OTA 파티션 테이블
-# ESP32-S3 4MB Flash 기준
+# DeepCoS3_Robot OTA Partition Table
+# ESP32-S3 4MB Flash
 # 
-# 사용법:
-#   Arduino IDE → Tools → Partition Scheme → "Custom"
-#   .ino 파일과 같은 폴더에 이 파일이 있으면 자동 인식
+# Usage:
+#   Arduino IDE -> Tools -> Partition Scheme -> "Minimal SPIFFS" (or any)
+#   This file in sketch folder overrides the selected partition scheme automatically
 #
-# OTA 동작:
-#   1회차: ota_0 실행 → 새 펌웨어를 ota_1에 기록 → 재부팅 → ota_1 실행
-#   2회차: ota_1 실행 → 새 펌웨어를 ota_0에 기록 → 재부팅 → ota_0 실행
+# OTA Operation:
+#   1st: ota_0 runs -> writes new firmware to ota_1 -> reboot -> ota_1 runs
+#   2nd: ota_1 runs -> writes new firmware to ota_0 -> reboot -> ota_0 runs
 #
 # Name,    Type, SubType, Offset,   Size,     Flags
 nvs,       data, nvs,     0x9000,   0x5000,

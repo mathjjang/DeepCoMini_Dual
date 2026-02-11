@@ -57,10 +57,12 @@
 #define CFG_PASSTHRU_ENABLE     1
 
 // RTL GPIO → S3 핀 연결 (보드 배선에 맞게 수정)
-// BW16 사용 가능 GPIO: D0(PB0), D1(PB3), D6(PA26), D7(PA25), D8(PA27)
-// (D4/D5는 Serial1, D9~D12는 SPI에 사용 중)
-#define CFG_S3_EN_PIN           D6    // PA26 → S3 EN (RESET)
-#define CFG_S3_BOOT_PIN         D7    // PA25 → S3 GPIO0 (BOOT)
+// BW16 variant.h 기준 사용 가능 GPIO:
+//   AMB_D0(PA7), AMB_D1(PA8), AMB_D2(PA27), AMB_D3(PA30),
+//   AMB_D7(PA25), AMB_D8(PA26)
+// (AMB_D4/D5=Serial1, AMB_D9~D12=SPI에 사용 중, AMB_D6=PB3/SWD_CLK)
+#define CFG_S3_EN_PIN           AMB_D8  // PA26 → S3 EN (RESET)
+#define CFG_S3_BOOT_PIN         AMB_D7  // PA25 → S3 GPIO0 (BOOT)
 
 // 패스스루 UART 보드레이트 (esptool 기본값)
 #define CFG_PASSTHRU_BAUD       115200
@@ -75,13 +77,13 @@
 #define CFG_LINK_BAUD  115200
 
 // BW16 고정 핀 (variant에 의해 결정, 참고용)
-// Serial1 TX = D4 (PB1), Serial1 RX = D5 (PB2)
+// Serial1 TX = AMB_D4 (PB1), Serial1 RX = AMB_D5 (PB2)
 
 // =============================================
 // SPI 마스터 (카메라 링크)
 // =============================================
-// BW16 고정 핀: SS=D9(PA15), SCLK=D10(PA14), MISO=D11(PA13), MOSI=D12(PA12)
-#define CFG_SPI_SS_PIN        D9    // PA15
+// BW16 고정 핀: SS=AMB_D9(PA15), SCLK=AMB_D10(PA14), MISO=AMB_D11(PA13), MOSI=AMB_D12(PA12)
+#define CFG_SPI_SS_PIN        AMB_D9  // PA15
 #define CFG_SPI_HZ            30000000  // 30MHz (배선 품질에 따라 조정)
 #define CFG_SPI_BLOCK_BYTES   2048      // S3과 동일하게 맞춰야 함
 
@@ -91,8 +93,10 @@
 #define CFG_ENABLE_CAMERA_BRIDGE  1
 
 // 프레임 버퍼 최대 크기
-// v0.1.2: 64KB→128KB로 확대 (VGA JPEG도 수용 가능)
-#define CFG_FRAME_BUF_SIZE    (128 * 1024)  // 128KB
+// RTL8720DN RAM 제약: BD_RAM_NS 영역 한계로 128KB 불가
+// QVGA(320x240) JPEG @Q10~15 = 3~8KB 이므로 8KB면 충분
+// VGA 해상도는 RTL8720DN에서 지원 불가 (RAM 부족)
+#define CFG_FRAME_BUF_SIZE    (8 * 1024)  // 8KB (QVGA 전용)
 
 // =============================================
 // WebSocket 서버 포트

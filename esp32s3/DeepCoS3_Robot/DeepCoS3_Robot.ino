@@ -12,14 +12,16 @@
 
 #include "config.h"
 #include <Arduino.h>
-#include <sstream>
 #include <stdarg.h>
+#include <string.h>
 
 #include <ArduinoJson.h>
 
 // FreeRTOS (Arduino-ESP32)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "dcm_spi_protocol.h"
 
 // -----------------------------
 // Logging policy (기본 전제: PC는 RTL만 USB로 연결)
@@ -92,6 +94,7 @@ struct LedFlash {
   uint32_t untilMs = 0;
 };
 static LedFlash g_sideFlash;
+static portMUX_TYPE g_ledMux = portMUX_INITIALIZER_UNLOCKED;
 
 static inline void updateLedStatusFromLinks();
 static void startSideFlash(uint32_t color, uint8_t blinks, uint16_t onMs, uint16_t offMs);
@@ -129,24 +132,6 @@ static constexpr int SPI_CS_PIN   = CFG_SPI_CS_PIN;
 static constexpr size_t SPI_BLOCK_BYTES = CFG_SPI_BLOCK_BYTES;
 static constexpr int SPI_QUEUE_SIZE = CFG_SPI_QUEUE_SIZE;
 
-#pragma pack(push, 1)
-struct DcmSpiHdr {
-  char magic[4];        // "DCM2"
-  uint8_t type;         // 0=idle, 1=jpeg
-  uint8_t flags;        // bit0=start, bit1=end
-  uint16_t seq;         // frame seq
-  uint32_t total_len;   // JPEG total length
-  uint32_t offset;      // offset of this payload
-  uint16_t payload_len; // payload bytes in this block
-  uint16_t reserved;
-};
-#pragma pack(pop)
-
-static constexpr uint8_t SPI_TYPE_IDLE = 0;
-static constexpr uint8_t SPI_TYPE_JPEG = 1;
-static constexpr uint8_t SPI_FLAG_START = 0x01;
-static constexpr uint8_t SPI_FLAG_END   = 0x02;
-
 static uint8_t* g_spiTx[SPI_QUEUE_SIZE] = {nullptr, nullptr};
 static uint8_t* g_spiRx[SPI_QUEUE_SIZE] = {nullptr, nullptr};
 static spi_slave_transaction_t g_trans[SPI_QUEUE_SIZE];
@@ -160,63 +145,71 @@ static bool g_camEnabled = true;
 static uint16_t g_frameSeq = 1;
 static camera_fb_t* g_fb = nullptr;
 static size_t g_fbOff = 0;
+static SemaphoreHandle_t g_frameMutex = nullptr;
 
 static void fillTxBlock(uint8_t* buf) {
   if (!buf) return;
-  memset(buf, 0, SPI_BLOCK_BYTES);
+  if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
+  do {
+    memset(buf, 0, SPI_BLOCK_BYTES);
 
-  DcmSpiHdr* h = (DcmSpiHdr*)buf;
-  h->magic[0] = 'D'; h->magic[1] = 'C'; h->magic[2] = 'M'; h->magic[3] = '2';
-  h->type = SPI_TYPE_IDLE;
-  h->flags = 0;
-  h->seq = 0;
-  h->total_len = 0;
-  h->offset = 0;
-  h->payload_len = 0;
-  h->reserved = 0;
+    DcmSpiHdr* h = (DcmSpiHdr*)buf;
+    h->magic[0] = 'D'; h->magic[1] = 'C'; h->magic[2] = 'M'; h->magic[3] = '2';
+    h->type = SPI_TYPE_IDLE;
+    h->flags = 0;
+    h->seq = 0;
+    h->total_len = 0;
+    h->offset = 0;
+    h->payload_len = 0;
+    h->crc16 = 0;
 
-  if (!g_camEnabled) {
-    return;
-  }
-
-  // 프레임 없으면 새로 캡처 (SPI 클럭이 실제로 돌 때만)
-  const uint32_t now = millis();
-  if (!g_fb) {
-    // SPI activity 없으면 캡처하지 않음(불필요한 카메라 부하 감소)
-    if (now - g_lastSpiActivityMs > 500) return;
-    g_fb = esp_camera_fb_get();
-    if (!g_fb || !g_fb->buf || g_fb->len == 0) {
-      if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
-      return;
+    if (!g_camEnabled) {
+      break;
     }
-    g_fbOff = 0;
-    g_frameSeq++;
-  }
 
-  const size_t headerSz = sizeof(DcmSpiHdr);
-  const size_t maxPayload = SPI_BLOCK_BYTES - headerSz;
-  const size_t remain = (g_fb->len > g_fbOff) ? (g_fb->len - g_fbOff) : 0;
-  const size_t pl = (remain > maxPayload) ? maxPayload : remain;
+    // 프레임 없으면 새로 캡처 (SPI 클럭이 실제로 돌 때만)
+    const uint32_t now = millis();
+    if (!g_fb) {
+      // SPI activity 없으면 캡처하지 않음(불필요한 카메라 부하 감소)
+      if (now - g_lastSpiActivityMs > 500) break;
+      g_fb = esp_camera_fb_get();
+      if (!g_fb || !g_fb->buf || g_fb->len == 0) {
+        if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
+        break;
+      }
+      g_fbOff = 0;
+      g_frameSeq++;
+    }
 
-  h->type = SPI_TYPE_JPEG;
-  h->seq = g_frameSeq;
-  h->total_len = (uint32_t)g_fb->len;
-  h->offset = (uint32_t)g_fbOff;
-  h->payload_len = (uint16_t)pl;
-  if (g_fbOff == 0) h->flags |= SPI_FLAG_START;
-  if (g_fbOff + pl >= g_fb->len) h->flags |= SPI_FLAG_END;
+    const size_t headerSz = sizeof(DcmSpiHdr);
+    const size_t maxPayload = SPI_BLOCK_BYTES - headerSz;
+    const size_t remain = (g_fb->len > g_fbOff) ? (g_fb->len - g_fbOff) : 0;
+    const size_t pl = (remain > maxPayload) ? maxPayload : remain;
 
-  if (pl > 0) {
-    memcpy(buf + headerSz, g_fb->buf + g_fbOff, pl);
-    g_fbOff += pl;
-  }
+    h->type = SPI_TYPE_JPEG;
+    h->seq = g_frameSeq;
+    h->total_len = (uint32_t)g_fb->len;
+    h->offset = (uint32_t)g_fbOff;
+    h->payload_len = (uint16_t)pl;
+    if (g_fbOff == 0) h->flags |= SPI_FLAG_START;
+    if (g_fbOff + pl >= g_fb->len) h->flags |= SPI_FLAG_END;
 
-  // 마지막 청크까지 tx buffer에 복사했으면 fb는 즉시 반환 가능(이미 buf로 복사됨)
-  if (g_fb && g_fbOff >= g_fb->len) {
-    esp_camera_fb_return(g_fb);
-    g_fb = nullptr;
-    g_fbOff = 0;
-  }
+    if (pl > 0) {
+      memcpy(buf + headerSz, g_fb->buf + g_fbOff, pl);
+      h->crc16 = crc16Ccitt(buf + headerSz, pl);
+      g_fbOff += pl;
+    } else {
+      h->crc16 = 0;
+    }
+
+    // 마지막 청크까지 tx buffer에 복사했으면 fb는 즉시 반환 가능(이미 buf로 복사됨)
+    if (g_fb && g_fbOff >= g_fb->len) {
+      esp_camera_fb_return(g_fb);
+      g_fb = nullptr;
+      g_fbOff = 0;
+    }
+  } while (0);
+  if (g_frameMutex) xSemaphoreGive(g_frameMutex);
 }
 
 static bool spiSlaveInit() {
@@ -349,38 +342,45 @@ static inline void updateLedStatusFromLinks() {
 }
 
 static void startSideFlash(uint32_t color, uint8_t blinks, uint16_t onMs, uint16_t offMs) {
+  portENTER_CRITICAL(&g_ledMux);
   g_sideFlash.color = color;
   g_sideFlash.blinksRemaining = blinks;
   g_sideFlash.on = true;
   g_sideFlash.onMs = onMs;
   g_sideFlash.offMs = offMs;
   g_sideFlash.untilMs = millis() + onMs;
+  portEXIT_CRITICAL(&g_ledMux);
   sideLedsShowSolid(color);
 }
 
 static void ledUpdateOnce() {
   const uint32_t nowMs = millis();
+  bool doSideShowOff = false;
+  bool doSideShowColor = false;
+  uint32_t sideColor = 0;
 
   // 1) Side flash overlay
-  if (g_sideFlash.blinksRemaining > 0) {
-    if (nowMs >= g_sideFlash.untilMs) {
-      if (g_sideFlash.on) {
-        g_sideFlash.on = false;
-        g_sideFlash.untilMs = nowMs + g_sideFlash.offMs;
-        sideLedsShowOff();
-      } else {
-        g_sideFlash.blinksRemaining--;
-        if (g_sideFlash.blinksRemaining == 0) {
-          // flash done -> fall through
-        } else {
-          g_sideFlash.on = true;
-          g_sideFlash.untilMs = nowMs + g_sideFlash.onMs;
-          sideLedsShowSolid(g_sideFlash.color);
-        }
+  portENTER_CRITICAL(&g_ledMux);
+  if (g_sideFlash.blinksRemaining > 0 && nowMs >= g_sideFlash.untilMs) {
+    if (g_sideFlash.on) {
+      g_sideFlash.on = false;
+      g_sideFlash.untilMs = nowMs + g_sideFlash.offMs;
+      doSideShowOff = true;
+    } else {
+      g_sideFlash.blinksRemaining--;
+      if (g_sideFlash.blinksRemaining > 0) {
+        g_sideFlash.on = true;
+        g_sideFlash.untilMs = nowMs + g_sideFlash.onMs;
+        doSideShowColor = true;
+        sideColor = g_sideFlash.color;
       }
     }
   }
   const bool sideOverlayActive = (g_sideFlash.blinksRemaining > 0);
+  portEXIT_CRITICAL(&g_ledMux);
+
+  if (doSideShowOff) sideLedsShowOff();
+  if (doSideShowColor) sideLedsShowSolid(sideColor);
 
   // 2) Steady-state rendering (ported from v1.3)
   switch (g_ledStatus) {
@@ -523,6 +523,9 @@ FastAccelStepper* stepperLeft = nullptr;
 FastAccelStepper* stepperRight = nullptr;
 
 static constexpr float maxSpeedLimit = CFG_MAX_SPEED_LIMIT;
+static constexpr int MAX_MOVE_STEP_CMD = 50000;
+static constexpr int MAX_ANGLE_CMD = 3600;
+static constexpr uint32_t CMD_WATCHDOG_MS = 3000;
 
 static void moveStep(int step) {
   if (!stepperLeft || !stepperRight) return;
@@ -561,9 +564,14 @@ static void stopRobot() {
   if (stepperRight) stepperRight->forceStop();
 }
 
-static void robotMoveJson(const std::string& json) {
+static void robotMoveJson(const char* json) {
+  if (!json) return;
   JsonDocument doc;
-  if (deserializeJson(doc, json.c_str()) != DeserializationError::Ok) return;
+  const DeserializationError err = deserializeJson(doc, json);
+  if (err != DeserializationError::Ok) {
+    linkLogf("robot json parse failed: %s", err.c_str());
+    return;
+  }
   JsonObject obj = doc.as<JsonObject>();
   float lspeed = obj["lspeed"] | 0.0f;
   float rspeed = obj["rspeed"] | 0.0f;
@@ -588,10 +596,12 @@ static void robotMoveJson(const std::string& json) {
 // -----------------------------
 // Command parsing (from v1.3's WS handler)
 // -----------------------------
-static void handleCommandLine(const String& line) {
+static void handleCommandLine(const char* line) {
+  if (!line || !line[0]) return;
+
   // Link-state updates from RTL (LED state machine input)
-  if (line.startsWith("@ws,")) {
-    const char v = (line.length() >= 5) ? line.charAt(4) : '0';
+  if (strncmp(line, "@ws,", 4) == 0) {
+    const char v = line[4] ? line[4] : '0';
     const bool newWs = (v == '1');
     const bool prevWs = g_wsConnected;
     g_wsConnected = newWs;
@@ -604,8 +614,8 @@ static void handleCommandLine(const String& line) {
     }
     return;
   }
-  if (line.startsWith("@sta,")) {
-    const int n = atoi(line.c_str() + 5);
+  if (strncmp(line, "@sta,", 5) == 0) {
+    const int n = atoi(line + 5);
     if (n < 0) return;
     const uint16_t prev = g_apStaCount;
     g_apStaCount = (uint16_t)n;
@@ -620,8 +630,8 @@ static void handleCommandLine(const String& line) {
   }
 
   // v0.1.3: @debug,0/@debug,1 — USB Serial 디버그 토글
-  if (line.startsWith("@debug,")) {
-    const char v = (line.length() >= 8) ? line.charAt(7) : '0';
+  if (strncmp(line, "@debug,", 7) == 0) {
+    const char v = line[7] ? line[7] : '0';
     g_usbDebugEnabled = (v == '1');
     linkLogf("USB debug %s", g_usbDebugEnabled ? "ON" : "OFF");
     if (g_usbDebugEnabled) {
@@ -631,49 +641,74 @@ static void handleCommandLine(const String& line) {
   }
 
   // (옵션) RTL이 @cam,0/@cam,1을 보내면 스트림을 끄고/켤 수는 있게 유지
-  if (line.startsWith("@cam,")) {
-    const char v = (line.length() >= 6) ? line.charAt(5) : '1';
+  if (strncmp(line, "@cam,", 5) == 0) {
+    const char v = line[5] ? line[5] : '1';
+    if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
     g_camEnabled = (v == '1');
     if (!g_camEnabled && g_fb) {
       esp_camera_fb_return(g_fb);
       g_fb = nullptr;
       g_fbOff = 0;
     }
+    if (g_frameMutex) xSemaphoreGive(g_frameMutex);
     return;
   }
 
   // format: "key,value"
-  std::string s(line.c_str());
-  std::istringstream ss(s);
-  std::string key, value;
-  std::getline(ss, key, ',');
-  std::getline(ss, value);
+  const char* comma = strchr(line, ',');
+  if (!comma) return;
+  const size_t keyLen = (size_t)(comma - line);
+  const char* value = comma + 1;
 
-  if (key == "robot") {
+  if (keyLen == 5 && strncmp(line, "robot", 5) == 0) {
     robotMoveJson(value);
     return;
   }
 
-  const int valueInt = value.empty() ? 0 : atoi(value.c_str());
-  if (key == "stop") stopRobot();
-  else if (key == "forward") moveForward();
-  else if (key == "left") turnLeft();
-  else if (key == "right") turnRight();
-  else if (key == "move") moveStep(valueInt);
-  else if (key == "angle") moveAngle(valueInt);
+  const int valueInt = value[0] ? atoi(value) : 0;
+  if (keyLen == 4 && strncmp(line, "stop", 4) == 0) stopRobot();
+  else if (keyLen == 7 && strncmp(line, "forward", 7) == 0) moveForward();
+  else if (keyLen == 4 && strncmp(line, "left", 4) == 0) turnLeft();
+  else if (keyLen == 5 && strncmp(line, "right", 5) == 0) turnRight();
+  else if (keyLen == 4 && strncmp(line, "move", 4) == 0) {
+    int clamped = valueInt;
+    if (clamped > MAX_MOVE_STEP_CMD) clamped = MAX_MOVE_STEP_CMD;
+    if (clamped < -MAX_MOVE_STEP_CMD) clamped = -MAX_MOVE_STEP_CMD;
+    moveStep(clamped);
+  } else if (keyLen == 5 && strncmp(line, "angle", 5) == 0) {
+    int clamped = valueInt;
+    if (clamped > MAX_ANGLE_CMD) clamped = MAX_ANGLE_CMD;
+    if (clamped < -MAX_ANGLE_CMD) clamped = -MAX_ANGLE_CMD;
+    moveAngle(clamped);
+  }
 }
 
-static bool readLineFromSerial1(String& outLine) {
-  static String buf;
+static bool readLineFromSerial1(char* outLine, size_t outLen) {
+  if (!outLine || outLen == 0) return false;
+  static char buf[512];
+  static size_t pos = 0;
+  static bool overflowed = false;
   while (Serial1.available()) {
     char ch = (char)Serial1.read();
     if (ch == '\r') continue;
     if (ch == '\n') {
-      outLine = buf;
-      buf = "";
+      if (overflowed) {
+        linkLogf("UART line overflow (>512), line dropped");
+        pos = 0;
+        overflowed = false;
+        return false;
+      }
+      if (pos >= outLen) pos = outLen - 1;
+      memcpy(outLine, buf, pos);
+      outLine[pos] = '\0';
+      pos = 0;
       return true;
     }
-    if (buf.length() < 512) buf += ch;
+    if (pos < sizeof(buf) - 1) {
+      buf[pos++] = ch;
+    } else {
+      overflowed = true;
+    }
   }
   return false;
 }
@@ -731,6 +766,12 @@ void setup() {
   // Camera (현재는 브릿지 송출은 RTL쪽에서 담당)
   configCamera();
 
+  // Camera frame shared-state mutex
+  g_frameMutex = xSemaphoreCreateMutex();
+  if (!g_frameMutex) {
+    linkLogf("WARN: frame mutex create failed");
+  }
+
   // SPI slave init (camera stream)
   g_spiInitOk = spiSlaveInit();
 
@@ -765,9 +806,13 @@ void loop() {
   }
 
   // 폴백: 태스크 비활성 시 기존 방식 유지
-  spiSlavePoll();
-  String line;
-  if (readLineFromSerial1(line) && line.length() > 0) {
+  if (g_spiInitOk) {
+    spiSlavePoll();
+  } else {
+    vTaskDelay(5 / portTICK_PERIOD_MS);
+  }
+  char line[513];
+  if (readLineFromSerial1(line, sizeof(line)) && line[0] != '\0') {
     handleCommandLine(line);
   }
 }
@@ -778,7 +823,11 @@ void loop() {
 static void taskSpiCamera(void* arg) {
   (void)arg;
   for (;;) {
-    spiSlavePoll();
+    if (g_spiInitOk) {
+      spiSlavePoll();
+    } else {
+      vTaskDelay(5 / portTICK_PERIOD_MS);
+    }
     // 너무 빡빡하면 다른 태스크가 굶을 수 있어 최소한 yield
     taskYIELD();
   }
@@ -786,15 +835,29 @@ static void taskSpiCamera(void* arg) {
 
 static void taskRobotCtrl(void* arg) {
   (void)arg;
+  uint32_t lastCmdMs = millis();
+  bool watchdogStopped = false;
   for (;;) {
-    String line;
-    if (readLineFromSerial1(line)) {
-      if (line.length() > 0) {
+    char line[513];
+    if (readLineFromSerial1(line, sizeof(line))) {
+      if (line[0] != '\0') {
+        if (line[0] != '@') {
+          // 모터 제어 명령 계열만 워치독 타이머 리셋
+          lastCmdMs = millis();
+          watchdogStopped = false;
+        }
         handleCommandLine(line);
       }
       // 바로 다음 라인도 있을 수 있어 yield만
       taskYIELD();
       continue;
+    }
+    if ((millis() - lastCmdMs) > CMD_WATCHDOG_MS) {
+      stopRobot();
+      if (!watchdogStopped) {
+        linkLogf("command watchdog stop (>%lums no UART command)", (unsigned long)CMD_WATCHDOG_MS);
+        watchdogStopped = true;
+      }
     }
     // 수신 없으면 약간 쉬어줌
     vTaskDelay(1);

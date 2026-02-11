@@ -18,6 +18,7 @@
 */
 
 #include "config.h"
+#include "dcm_spi_protocol.h"
 #include <WiFi.h>
 #include <SPI.h>
 
@@ -146,6 +147,15 @@ static int pickChannelFromMac() {
 #else
   return CFG_AP_CHANNEL_DEFAULT;
 #endif
+}
+
+static bool isValidChannel(int ch) {
+  if (ch >= 1 && ch <= 13) return true; // 2.4GHz
+  static const int valid5g[] = {36, 40, 44, 48, 149, 153, 157, 161, 165};
+  for (size_t i = 0; i < (sizeof(valid5g) / sizeof(valid5g[0])); ++i) {
+    if (valid5g[i] == ch) return true;
+  }
+  return false;
 }
 
 static void sendSafetyStopToS3() {
@@ -306,6 +316,8 @@ static void startPassthruMode() {
   Serial.println("[RTL] ========================================");
   Serial.println("[RTL] S3 Flash Passthrough Mode (Option E)");
   Serial.println("[RTL] ========================================");
+  sendSafetyStopToS3();
+  delay(50);
   Serial.println("[RTL] 1. Entering S3 boot mode...");
   enterS3BootMode();
 
@@ -426,23 +438,7 @@ static void sendLedLinkStateToS3(bool force) {
 // -----------------------------
 // SPI framing (S3 -> RTL)
 // -----------------------------
-#pragma pack(push, 1)
-struct DcmSpiHdr {
-  char magic[4];        // "DCM2"
-  uint8_t type;         // 0=idle, 1=jpeg
-  uint8_t flags;        // bit0=start, bit1=end
-  uint16_t seq;         // frame seq
-  uint32_t total_len;   // JPEG total length
-  uint32_t offset;      // offset of this payload in JPEG
-  uint16_t payload_len; // bytes following header in this block
-  uint16_t reserved;
-};
-#pragma pack(pop)
-
-static constexpr uint8_t SPI_TYPE_IDLE = 0;
-static constexpr uint8_t SPI_TYPE_JPEG = 1;
-static constexpr uint8_t SPI_FLAG_START = 0x01;
-static constexpr uint8_t SPI_FLAG_END   = 0x02;
+static_assert(SPI_BLOCK_BYTES >= sizeof(DcmSpiHdr), "SPI block too small for DcmSpiHdr");
 
 static uint8_t g_spiRx[SPI_BLOCK_BYTES];
 
@@ -463,12 +459,13 @@ static volatile uint32_t g_statBytes = 0;
 static volatile uint32_t g_statSyncErrors = 0;   // 매직 불일치
 static volatile uint32_t g_statSeqErrors = 0;    // 시퀀스/오프셋 불일치로 드랍
 static volatile uint32_t g_statOversize = 0;     // 프레임 크기 초과로 드랍
+static volatile uint32_t g_statCrcErrors = 0;    // CRC 불일치
 
 // 통계 스냅샷: 매크로로 정의 (Arduino IDE 전처리기의 자동 프로토타입 생성이
 // struct 정의보다 앞에 놓여 에러 발생하는 문제 회피 — hdrLooksOk과 동일 패턴)
 // 사용법: SNAPSHOT_STATS(로컬변수prefix) → _블럭, _프레임 등 6개 로컬 변수 생성+리셋
 #if RTL_HAS_FREERTOS
-#define SNAPSHOT_AND_RESET_STATS(blk,frm,byt,syncE,seqE,ovs) \
+#define SNAPSHOT_AND_RESET_STATS(blk,frm,byt,syncE,seqE,ovs,crcE) \
   do { \
     taskENTER_CRITICAL(); \
     blk  = g_statBlocks;     g_statBlocks     = 0; \
@@ -477,10 +474,11 @@ static volatile uint32_t g_statOversize = 0;     // 프레임 크기 초과로 �
     syncE = g_statSyncErrors; g_statSyncErrors = 0; \
     seqE = g_statSeqErrors;  g_statSeqErrors  = 0; \
     ovs  = g_statOversize;   g_statOversize   = 0; \
+    crcE = g_statCrcErrors;  g_statCrcErrors  = 0; \
     taskEXIT_CRITICAL(); \
   } while(0)
 #else
-#define SNAPSHOT_AND_RESET_STATS(blk,frm,byt,syncE,seqE,ovs) \
+#define SNAPSHOT_AND_RESET_STATS(blk,frm,byt,syncE,seqE,ovs,crcE) \
   do { \
     blk  = g_statBlocks;     g_statBlocks     = 0; \
     frm  = g_statFrames;     g_statFrames     = 0; \
@@ -488,6 +486,7 @@ static volatile uint32_t g_statOversize = 0;     // 프레임 크기 초과로 �
     syncE = g_statSyncErrors; g_statSyncErrors = 0; \
     seqE = g_statSeqErrors;  g_statSeqErrors  = 0; \
     ovs  = g_statOversize;   g_statOversize   = 0; \
+    crcE = g_statCrcErrors;  g_statCrcErrors  = 0; \
   } while(0)
 #endif
 
@@ -532,7 +531,6 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
     }
     g_statBlocks++;
 
-    if (SPI_BLOCK_BYTES < sizeof(DcmSpiHdr)) continue;
     const DcmSpiHdr* hdr = (const DcmSpiHdr*)g_spiRx;
 
     if (!hdrLooksOk(*hdr)) {
@@ -598,6 +596,14 @@ static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
     const size_t headerSz = sizeof(DcmSpiHdr);
     if (pl > SPI_BLOCK_BYTES - headerSz) { haveHeader = false; continue; }
     if (hdr->offset + pl > expectedTotal) { haveHeader = false; continue; }
+    if (pl > 0) {
+      const uint16_t calc = crc16Ccitt(g_spiRx + headerSz, pl);
+      if (calc != hdr->crc16) {
+        g_statCrcErrors++;
+        haveHeader = false;
+        continue;
+      }
+    }
 
     // mutex로 memcpy + 메타데이터 갱신을 원자적으로 보호
     // (WS 태스크의 sendBinary도 mutex 하에 g_frameBuf 읽으므로 레이스 방지)
@@ -662,7 +668,9 @@ static void onControlWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_
     case WStype_TEXT: {
       // active control client의 텍스트만 S3로 전달
       if (num == g_controlClientNum && payload && length > 0) {
-        Serial1.write(payload, length);
+        static constexpr size_t kMaxFwd = 256;
+        const size_t fwdLen = (length > kMaxFwd) ? kMaxFwd : length;
+        Serial1.write(payload, fwdLen);
         Serial1.write('\n');
       }
       break;
@@ -799,10 +807,6 @@ void setup() {
 }
 
 // -----------------------------
-// WebSocket servers (Links2004/arduinoWebSockets)
-// -----------------------------
-
-// -----------------------------
 // v0.1.1: USB Serial 설정 명령 처리
 // @set,channel,149   → Wi-Fi 채널 변경 (재부팅 후 적용)
 // @set,password,xxxx → 비밀번호 변경 (재부팅 후 적용)
@@ -811,6 +815,16 @@ void setup() {
 // -----------------------------
 // volatile: pollUsbSerialCommands 콘텍스트에서 설정, @reboot 명령에서 읽기
 static volatile bool g_needReboot = false;
+
+static void warnRebootIfNeeded() {
+  static uint32_t lastWarnMs = 0;
+  if (!g_needReboot) return;
+  const uint32_t now = millis();
+  if (now - lastWarnMs >= 10000) {
+    lastWarnMs = now;
+    Serial.println("[RTL] WARN: settings changed, run @reboot to apply");
+  }
+}
 
 // 토큰 기반 명령 파싱: 하드코딩 인덱스 제거, char* 직접 사용
 static void handleSerialCommand(const char* cmd) {
@@ -825,12 +839,12 @@ static void handleSerialCommand(const char* cmd) {
 
     if (keyLen == 7 && strncmp(keyStart, "channel", 7) == 0) {
       int ch = atoi(val);
-      if (ch > 0 && ch < 200) {
+      if (isValidChannel(ch)) {
         g_apChannel = ch;
         g_needReboot = true;
         RTL_PRINTF(Serial, "[RTL] Channel set to %d (reboot to apply: @reboot)\n", g_apChannel);
       } else {
-        Serial.println("[RTL] Invalid channel");
+        Serial.println("[RTL] Invalid channel (2.4GHz:1~13, 5GHz:36/40/44/48/149/153/157/161/165)");
       }
     } else if (keyLen == 8 && strncmp(keyStart, "password", 8) == 0) {
       size_t pwLen = strlen(val);
@@ -866,6 +880,7 @@ static void handleSerialCommand(const char* cmd) {
       "\"frame_seq\":%u,"
       "\"frame_len\":%u,"
 #endif
+      "\"crc_err\":%lu,"
       "\"spi_hz\":%lu,"
       "\"buf_size\":%u"
       "}",
@@ -878,6 +893,7 @@ static void handleSerialCommand(const char* cmd) {
       (unsigned)g_frameSeq,
       (unsigned)g_frameLen,
 #endif
+      (unsigned long)g_statCrcErrors,
       (unsigned long)SPI_HZ,
       (unsigned)sizeof(g_frameBuf)
     );
@@ -1033,14 +1049,14 @@ void loop() {
   static uint32_t lastStatMs = 0;
   if (nowMs - lastStatMs >= CFG_STAT_INTERVAL_MS) {
     lastStatMs = nowMs;
-    uint32_t sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs;
-    SNAPSHOT_AND_RESET_STATS(sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs);
+    uint32_t sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs, sCrcE;
+    SNAPSHOT_AND_RESET_STATS(sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs, sCrcE);
     const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
     const float fps = (float)sFrm / secs;
     const float kbps = ((float)sByt / 1024.0f) / secs;
-    RTL_PRINTF(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu\n",
+    RTL_PRINTF(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu crc_err=%lu\n",
                   fps, (unsigned long)sBlk, kbps,
-                  (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs);
+                  (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs, (unsigned long)sCrcE);
   }
 #endif
 
@@ -1049,6 +1065,7 @@ void loop() {
 
   // v0.1.1: USB Serial 설정 명령 처리
   pollUsbSerialCommands();
+  warnRebootIfNeeded();
 }
 
 #if RTL_HAS_FREERTOS
@@ -1060,6 +1077,8 @@ static void taskWsUart(void* arg) {
   uint16_t lastSentSeq = 0;
   uint32_t lastStatMs = millis();
   uint32_t lastBeatMs = millis();
+  uint32_t mallocFailCount = 0;
+  uint32_t lastMallocFailLogMs = 0;
 
   for (;;) {
     pollControlClient();
@@ -1080,7 +1099,7 @@ static void taskWsUart(void* arg) {
       curSeq = g_frameSeq;
       curLen = (size_t)g_frameLen;
 
-      if (curLen > 0 && curSeq != 0 && curSeq != lastSentSeq && cameraClientConnected()) {
+      if (curLen > 0 && curSeq != lastSentSeq && cameraClientConnected()) {
         // [개선] 정적 RAM 점유를 피하기 위해 전송 직전에 동적 버퍼 할당
         // 할당 성공 시: Mutex 구간에서는 memcpy만 수행 후 즉시 해제
         txBuf = (uint8_t*)malloc(curLen);
@@ -1088,6 +1107,8 @@ static void taskWsUart(void* arg) {
           memcpy(txBuf, g_frameBuf, curLen);
           lastSentSeq = curSeq;
           needSend = true;
+        } else {
+          mallocFailCount++;
         }
       }
       // --- Mutex Critical Section End ---
@@ -1098,25 +1119,31 @@ static void taskWsUart(void* arg) {
         (void)wsCamera.sendBIN(g_cameraClientNum, (const uint8_t*)txBuf, curLen);
         free(txBuf);
       }
+      const uint32_t nowMs = millis();
+      if (mallocFailCount > 0 && (nowMs - lastMallocFailLogMs) >= 5000) {
+        lastMallocFailLogMs = nowMs;
+        RTL_PRINTF(Serial, "[RTL][WS] WARN: tx malloc failed %lu times\n", (unsigned long)mallocFailCount);
+      }
     }
 
     // 성능 로그: SPI task가 stat을 올리고, 출력만 여기서
     const uint32_t nowMs = millis();
     if (nowMs - lastStatMs >= CFG_STAT_INTERVAL_MS) {
       lastStatMs = nowMs;
-      uint32_t sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs;
-      SNAPSHOT_AND_RESET_STATS(sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs);
+      uint32_t sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs, sCrcE;
+      SNAPSHOT_AND_RESET_STATS(sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs, sCrcE);
       const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
       const float fps = (float)sFrm / secs;
       const float kbps = ((float)sByt / 1024.0f) / secs;
-      RTL_PRINTF(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu\n",
+      RTL_PRINTF(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu crc_err=%lu\n",
                     fps, (unsigned long)sBlk, kbps,
-                    (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs);
+                    (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs, (unsigned long)sCrcE);
     }
 #endif
 
     pumpS3TextToWs();
     pollUsbSerialCommands();
+    warnRebootIfNeeded();
 
     // 태스크 동작 확인용 하트비트(5초마다)
     const uint32_t nowBeat = millis();

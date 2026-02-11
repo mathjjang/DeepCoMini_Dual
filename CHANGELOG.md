@@ -5,6 +5,74 @@
 
 ---
 
+## [v0.1.8] — 2026-02-11 — SPI CRC16 무결성 + S3 안전성 강화 + 코드 품질 개선
+
+### 배경
+- v0.1.7 코드 리뷰에서 데이터 무결성, 메모리 안정성, 안전성 관련 개선점 도출
+- RTL/S3 양쪽에 걸쳐 9건의 개선 사항 적용
+- SPI 프로토콜 공유 헤더 분리로 양 칩 간 구조체 동기화 보장
+
+### SPI 프로토콜 무결성 (RTL + S3)
+- **CRC16-CCITT 검증 추가** — SPI 데이터 무결성 보장
+  - `DcmSpiHdr.crc16` 필드 추가 (기존 `reserved` 필드 대체)
+  - S3 `fillTxBlock()`: 매 블록마다 `crc16Ccitt(payload)` 계산 후 헤더에 삽입
+  - RTL `pullOneJpegFrameOverSpi()`: 수신 시 CRC 검증, 불일치 시 `g_statCrcErrors++`
+  - `@diag` JSON에 `crc_err` 필드 추가
+  - SPI 성능 로그에 `crc_err` 카운트 추가
+- **`dcm_spi_protocol.h` 공유 헤더 신규** — 프로토콜 동기화 보장
+  - `DcmSpiHdr` 구조체, `SPI_TYPE_*`, `SPI_FLAG_*` 상수, `crc16Ccitt()` 함수
+  - RTL/S3 양쪽 `.ino`에서 인라인 정의 제거 → `#include "dcm_spi_protocol.h"`
+  - 양 칩의 구조체 크기·필드 순서 불일치 위험 근본 제거
+- **`static_assert(SPI_BLOCK_BYTES >= sizeof(DcmSpiHdr))`** — 컴파일 타임 검증 (RTL)
+
+### S3 안전성 강화 (DeepCoS3_Robot.ino)
+- **모터 명령 워치독 (3초)** — UART 단절 시 안전 정지
+  - `CMD_WATCHDOG_MS = 3000`: 3초간 모터 명령 없으면 `stopRobot()` 자동 호출
+  - `@ws,*`, `@sta,*` 등 상태 메시지는 워치독 리셋하지 않음 (모터 명령만 리셋)
+  - 한 번 트리거 시 `linkLogf()` 경고 1회 출력 (로그 홍수 방지)
+- **`move`/`angle` 명령 클램핑** — 비정상 큰 값 방지
+  - `MAX_MOVE_STEP_CMD = 50000`, `MAX_ANGLE_CMD = 3600`
+- **프레임 버퍼 mutex 보호** — `fillTxBlock()` + `@cam,` 명령 동시 접근 안전
+  - `g_frameMutex` (xSemaphoreCreateMutex) 추가
+  - `fillTxBlock()`: do/while(0) + mutex 래핑
+  - `@cam,0` 명령: mutex 하에 `g_camEnabled`/`g_fb` 조작
+- **LED 플래시 spinlock** — 멀티태스크 LED 상태 안전
+  - `portMUX_TYPE g_ledMux` 추가
+  - `startSideFlash()` / `ledUpdateOnce()`: `portENTER/EXIT_CRITICAL` 보호
+- **SPI 초기화 실패 시 안전 폴백**
+  - `taskSpiCamera` / `loop()`: `g_spiInitOk` 체크 후 `vTaskDelay(5)` 폴백
+
+### S3 메모리·코드 품질 (DeepCoS3_Robot.ino)
+- **UART 수신: String → char[] 전환** — 힙 파편화 근본 제거
+  - `readLineFromSerial1(char*, size_t)`: static char buf[512] + 오버플로우 감지
+  - `handleCommandLine(const char*)`: `strncmp`/`strchr` 토큰 파싱
+  - `#include <sstream>` 삭제 — `std::istringstream`/`std::string` 완전 제거
+- **`robotMoveJson(const char*)` 시그니처 변경** — `std::string` 힙 할당 제거
+
+### RTL 안정성·운영 개선 (DeepCoRTL_Bridge.ino)
+- **WS 텍스트 전달 길이 제한** — UART 블로킹 방지
+  - `kMaxFwd = 256`: 15KB WS 메시지가 UART를 1.3초 블록하는 문제 해결
+- **패스스루 진입 전 안전 정지** — S3 리부트 전 모터 정지 보장
+  - `startPassthruMode()`: `sendSafetyStopToS3()` + `delay(50)` 추가
+- **Wi-Fi 채널 화이트리스트 검증** — 잘못된 채널 설정 방지
+  - `isValidChannel()`: 2.4GHz(1~13) + 5GHz(36/40/44/48/149/153/157/161/165)
+  - 기존 `ch > 0 && ch < 200` → 유효 채널만 허용
+- **설정 변경 리부트 알림** — `g_needReboot` 활용
+  - `warnRebootIfNeeded()`: 10초 주기로 "[RTL] WARN: settings changed" 콘솔 출력
+  - `loop()` + `taskWsUart` 양쪽에서 호출
+- **malloc 실패 로깅** — `taskWsUart`
+  - `mallocFailCount` 카운터 + 5초 주기 경고 로그
+- **frameSeq 0 래핑 수정** — `curSeq != 0` 조건 제거 → 매 36분 1프레임 누락 해결
+- **빈 섹션 주석 제거** — "WebSocket servers" 잔존 주석 정리
+
+### 변경 파일
+- **신규**: `rtl8720dn/DeepCoRTL_Bridge/dcm_spi_protocol.h` (37줄) — SPI 프로토콜 공유 헤더
+- **신규**: `esp32s3/DeepCoS3_Robot/dcm_spi_protocol.h` (37줄) — 동일 복사본
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — CRC16, 채널검증, 패스스루안전, 리부트알림, WS제한, malloc로그 (+99줄 변경)
+- `esp32s3/DeepCoS3_Robot/DeepCoS3_Robot.ino` — 워치독, char[]전환, mutex, spinlock, CRC16, 클램핑 (+246/-156줄 변경)
+
+---
+
 ## [v0.1.7] — 2026-02-11 — WebSocket 라이브러리 교체 (arduinoWebSockets)
 
 ### 배경

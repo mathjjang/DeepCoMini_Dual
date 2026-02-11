@@ -115,6 +115,28 @@
 
 ---
 
+## v0.1.8 — SPI CRC16 무결성 + S3 안전성 강화 + 코드 품질 개선
+
+- [x] SPI CRC16-CCITT 검증 추가 (DcmSpiHdr.crc16, S3 송신 + RTL 수신)
+- [x] dcm_spi_protocol.h 공유 헤더 분리 (구조체·상수·CRC 함수)
+- [x] static_assert 컴파일 타임 SPI 블록 크기 검증 (RTL)
+- [x] S3 모터 명령 워치독 3초 (UART 단절 시 자동 정지)
+- [x] S3 move/angle 명령 클램핑 (MAX_MOVE_STEP_CMD, MAX_ANGLE_CMD)
+- [x] S3 프레임 버퍼 mutex 보호 (fillTxBlock + @cam 동시접근 안전)
+- [x] S3 LED 플래시 spinlock (portMUX_TYPE g_ledMux)
+- [x] S3 UART 수신 String→char[] 전환 (readLineFromSerial1, handleCommandLine)
+- [x] S3 std::istringstream/std::string 완전 제거 (#include <sstream> 삭제)
+- [x] RTL WS 텍스트 전달 256B 제한 (UART 블로킹 방지)
+- [x] RTL 패스스루 진입 전 안전 정지 (sendSafetyStopToS3)
+- [x] RTL Wi-Fi 채널 화이트리스트 검증 (isValidChannel)
+- [x] RTL 설정 변경 리부트 알림 (warnRebootIfNeeded, 10초 주기)
+- [x] RTL malloc 실패 로깅 (mallocFailCount + 5초 주기 경고)
+- [x] RTL frameSeq 0 래핑 누락 수정 (curSeq != 0 조건 제거)
+- [x] RTL @diag JSON에 crc_err 필드 추가
+- [x] RTL 빈 섹션 주석 정리
+
+---
+
 ## Backlog (미배정 — 필요 시 버전에 할당)
 
 - [ ] OTA(무선) 펌웨어 업데이트 지원 (누적 단계 2)
@@ -125,8 +147,7 @@
 - [ ] SPI 단일 링크로 제어+카메라 멀티플렉싱 통합
   - 현재: UART(제어) + SPI(카메라) 2링크
   - 목표: SPI 하나로 통합하여 배선 단순화
-- [ ] 프레임 CRC32 체크 활성화
-  - `dual_chip개발 전략.md`에 설계는 있으나 구현 보류 중
+- [ ] ~~프레임 CRC32 체크~~ → v0.1.8에서 CRC16-CCITT로 구현 완료
 - [ ] Wi-Fi 설정 EEPROM/Flash 영구 저장
   - 현재: 재부팅 시 config.h 기본값으로 복원
 
@@ -144,3 +165,4 @@
 | v0.1.5 | 2026-02-11 | 옵션 E: S3 패스스루 플래시, @passthru 명령 |
 | v0.1.6 | 2026-02-11 | 동시성 안전, 메모리 안정성, WS 프로토콜 강화 |
 | v0.1.7 | 2026-02-11 | WebSocket: MiniWS→arduinoWebSockets, RTOS mutex 최적화 |
+| v0.1.8 | 2026-02-11 | SPI CRC16 무결성, S3 워치독/char[] 전환, 공유 헤더 분리 |

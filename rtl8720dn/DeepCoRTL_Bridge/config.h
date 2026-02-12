@@ -10,7 +10,7 @@
 // =============================================
 // 펌웨어 버전 (GitHub 태그와 반드시 일치시킬 것)
 // =============================================
-#define CFG_FW_VERSION    "0.1.10"
+#define CFG_FW_VERSION    "0.2.0"
 #define CFG_FW_CHIP       "RTL"
 
 // =============================================
@@ -88,9 +88,10 @@
 // =============================================
 // SPI 마스터 (카메라 링크)
 // =============================================
-// BW16 고정 핀: SS=AMB_D9(PA15), SCLK=AMB_D10(PA14), MISO=AMB_D11(PA13), MOSI=AMB_D12(PA12)
-#define CFG_SPI_SS_PIN        AMB_D9  // PA15
-#define CFG_SPI_HZ            30000000  // 30MHz (배선 품질에 따라 조정)
+// BW16 기본 SPI 핀: SCLK=AMB_D10(PA14), MISO=AMB_D11(PA13), MOSI=AMB_D12(PA12)
+// SS는 보드/부트 안정성에 맞춰 변경 가능 (현재: AMB_D3/PA30)
+#define CFG_SPI_SS_PIN        AMB_D3  // PA30
+#define CFG_SPI_HZ            10000000  // 10MHz
 #define CFG_SPI_BLOCK_BYTES   2048      // S3과 동일하게 맞춰야 함
 
 // =============================================
@@ -109,20 +110,6 @@
 // =============================================
 #define CFG_WS_CONTROL_PORT   80    // ws://ip/ws
 #define CFG_WS_CAMERA_PORT    81    // ws://ip:81/
-
-// =============================================
-// 로그 레벨 설정
-// =============================================
-// LOG_NONE  (0) = 출력 완전 차단 (배포/생산)
-// LOG_INFO  (1) = 핵심 이벤트만 (부팅, 연결, OTA, 에러)
-// LOG_DEBUG (2) = 전부 출력 (SPI 통계, heartbeat, 성능 등)
-//
-// 런타임 변경: USB Serial에서 @debug,0/1/2
-#define LOG_NONE   0
-#define LOG_INFO   1
-#define LOG_DEBUG  2
-
-#define CFG_LOG_LEVEL   LOG_INFO    // 기본 로그 레벨
 
 // =============================================
 // 성능 로그 간격

@@ -9,7 +9,7 @@
 // =============================================
 // 펌웨어 버전 (GitHub 태그와 반드시 일치시킬 것)
 // =============================================
-#define CFG_FW_VERSION    "0.1.10"
+#define CFG_FW_VERSION    "0.2.0"
 #define CFG_FW_CHIP       "S3"
 
 // =============================================
@@ -40,10 +40,10 @@
 // =============================================
 // SPI 슬레이브 (카메라 → RTL)
 // =============================================
-#define CFG_SPI_SCLK_PIN    36
-#define CFG_SPI_MOSI_PIN    37      // Master(RTL) → Slave(S3)
-#define CFG_SPI_MISO_PIN    35      // Slave(S3) → Master(RTL)
-#define CFG_SPI_CS_PIN      34      // Slave Select
+#define CFG_SPI_SCLK_PIN    45
+#define CFG_SPI_MOSI_PIN    20      // Master(RTL) → Slave(S3)
+#define CFG_SPI_MISO_PIN    19      // Slave(S3) → Master(RTL)
+#define CFG_SPI_CS_PIN      46      // Slave Select
 #define CFG_SPI_BLOCK_BYTES 2048    // DMA 블록 크기
 #define CFG_SPI_QUEUE_SIZE  2       // SPI 큐 깊이
 
@@ -70,7 +70,7 @@
 #define CFG_CAM_PCLK_PIN    13
 
 #define CFG_CAM_XCLK_FREQ   20000000  // 20MHz
-#define CFG_CAM_JPEG_QUALITY 12       // 1(최고)~63(최저)
+#define CFG_CAM_JPEG_QUALITY 25       // 1(최고)~63(최저), RTL 버퍼 8KB 이내 유지
 #define CFG_CAM_FB_COUNT     2        // 프레임 버퍼 개수
 
 // =============================================

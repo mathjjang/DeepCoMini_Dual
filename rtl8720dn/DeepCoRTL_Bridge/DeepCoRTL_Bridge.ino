@@ -1,6 +1,6 @@
 /*
   DeepCoRTL_Bridge.ino (RTL8720DN / BW16 등, Arduino IDE)
-  FW Version: 0.1.10  (config.h CFG_FW_VERSION 과 일치시킬 것)
+  FW Version: 0.2.0  (config.h CFG_FW_VERSION 과 일치시킬 것)
 
   목표:
   - RTL8720DN이 Wi‑Fi AP + WebSocket 서버를 제공 (로봇 IP = 192.168.4.1)
@@ -48,21 +48,6 @@ extern "C" {
 #define RTL_PRINTF(ser, fmt, ...) \
   do { char _pf[192]; snprintf(_pf, sizeof(_pf), fmt, ##__VA_ARGS__); ser.print(_pf); } while(0)
 
-// v0.1.10: 3단계 로그 레벨 매크로
-static uint8_t g_logLevel = CFG_LOG_LEVEL;
-
-// INFO: 부팅, 연결, OTA, 에러 등 핵심 이벤트
-#define RTL_INFO(ser, fmt, ...) \
-  do { if (g_logLevel >= LOG_INFO) RTL_PRINTF(ser, fmt, ##__VA_ARGS__); } while(0)
-
-// DEBUG: SPI 통계, heartbeat, 성능, 상세 로그
-#define RTL_DEBUG(ser, fmt, ...) \
-  do { if (g_logLevel >= LOG_DEBUG) RTL_PRINTF(ser, fmt, ##__VA_ARGS__); } while(0)
-
-// 레벨 무관 항상 출력 (Serial.println 대체용)
-#define RTL_LOG_ALWAYS(ser, msg) \
-  do { if (g_logLevel >= LOG_INFO) ser.println(msg); } while(0)
-
 // -----------------------------
 // Optional: split work into RTOS tasks (if available)
 // - Task A: WS accept/poll + UART (robot control + log pump)
@@ -94,9 +79,9 @@ static uint8_t g_logLevel = CFG_LOG_LEVEL;
 // 사용자가 원하는 구조(태스크 분리)를 기본값으로 켬.
 // 단, RTL Arduino 코어에서 FreeRTOS 헤더가 없으면 자동으로 loop() 방식으로 폴백됩니다.
 static constexpr bool RTL_USE_TASKS = (RTL_HAS_FREERTOS != 0);
-static bool g_tasksEnabledRuntime = RTL_USE_TASKS; // task 생성 실패 시 loop 모드로 런타임 폴백
 #if RTL_HAS_FREERTOS
 static bool g_tasksStartedRuntime = false;
+static void ensureTasksStartedOnce();
 #endif
 
 // -----------------------------
@@ -122,7 +107,7 @@ static constexpr int RTL_LOG_TX_PIN = AMB_D0;  // PA7 (USB 디버그)
 static constexpr int RTL_LOG_RX_PIN = AMB_D1;  // PA8
 static constexpr int RTL_LINK_TX_PIN = AMB_D4; // PB1, RTL→S3
 static constexpr int RTL_LINK_RX_PIN = AMB_D5; // PB2, S3→RTL
-static constexpr int RTL_SPI_SS_PIN_DOC   = AMB_D9;  // PA15
+static constexpr int RTL_SPI_SS_PIN_DOC   = CFG_SPI_SS_PIN;  // configurable (current: AMB_D3/PA30)
 static constexpr int RTL_SPI_SCLK_PIN_DOC = AMB_D10; // PA14
 static constexpr int RTL_SPI_MISO_PIN_DOC = AMB_D11; // PA13
 static constexpr int RTL_SPI_MOSI_PIN_DOC = AMB_D12; // PA12
@@ -139,9 +124,9 @@ static uint8_t g_spiRx[SPI_BLOCK_BYTES];
 
 #define ENABLE_CAMERA_BRIDGE CFG_ENABLE_CAMERA_BRIDGE
 
-// 설계 방침(사용자 요청):
-// - RTL은 SPI로 "항상" 카메라 프레임을 당겨서 최신 프레임을 유지한다.
-// - WS 카메라 클라이언트가 연결되어 있을 때만 네트워크로 송출한다.
+// v0.2.0: Snap-based camera protocol
+// RTL sends "@snap" via UART → S3 captures frame → S3 responds "@snap,ok,<len>"
+// → RTL clocks SPI blocks to pull JPEG chunks → send to WS camera client
 
 // -----------------------------
 // Helpers
@@ -163,7 +148,7 @@ static int pickChannelFromMac() {
   WiFi.macAddress(mac);
   int idx = mac[5] % CFG_AP_CHANNEL_POOL_SIZE;
   int ch = channelPool[idx];
-  RTL_DEBUG(Serial, "[RTL] Auto-channel: MAC[5]=0x%02X -> pool[%d] = ch %d\n", mac[5], idx, ch);
+  RTL_PRINTF(Serial, "[RTL] Auto-channel: MAC[5]=0x%02X → pool[%d] = ch %d\n", mac[5], idx, ch);
   return ch;
 #else
   return CFG_AP_CHANNEL_DEFAULT;
@@ -207,6 +192,10 @@ static inline bool cameraClientConnected() {
   return hasCameraClient && g_cameraClientNum != 0xFF && wsCamera.clientIsConnected(g_cameraClientNum);
 }
 #endif
+
+// 프레임/스트림 상태 — pollCameraClient() 등에서 사용하므로 선행 선언
+static volatile bool g_frameReady = false;   // taskSpiPull→true, taskWsUart→false
+static volatile bool g_streaming  = false;   // stream mode (UART-free SPI pull)
 
 // =============================================================
 // v0.1.9: WebSocket OTA 펌웨어 업데이트
@@ -258,10 +247,10 @@ static bool otaChooseAddress() {
     g_ota.addrNew = OTA_ADDR_2;
     g_ota.addrOld = OTA_ADDR_1;
   } else {
-    RTL_INFO(Serial, "[OTA] ERR: no valid image found in flash\n");
+    Serial.println("[OTA] ERR: no valid image found in flash");
     return false;
   }
-  RTL_INFO(Serial, "[OTA] target=0x%06X, current=0x%06X\n",
+  RTL_PRINTF(Serial, "[OTA] target=0x%06X, current=0x%06X\n",
              (unsigned)g_ota.addrNew, (unsigned)g_ota.addrOld);
   return true;
 }
@@ -269,12 +258,12 @@ static bool otaChooseAddress() {
 // OTA: Flash 섹터 삭제 (이미지 크기만큼)
 static bool otaEraseFlash(uint32_t imageSize) {
   const uint32_t sectors = (imageSize + OTA_SECTOR_SZ - 1) / OTA_SECTOR_SZ;
-  RTL_INFO(Serial, "[OTA] erasing %lu sectors (%lu bytes)...\n",
+  RTL_PRINTF(Serial, "[OTA] erasing %lu sectors (%lu bytes)...\n",
              (unsigned long)sectors, (unsigned long)imageSize);
   for (uint32_t i = 0; i < sectors; i++) {
     flash_erase_sector(&g_ota.flash, g_ota.addrNew + i * OTA_SECTOR_SZ);
   }
-  RTL_INFO(Serial, "[OTA] erase done\n");
+  Serial.println("[OTA] erase done");
   return true;
 }
 
@@ -318,7 +307,7 @@ static void otaBegin(uint32_t imageSize) {
   g_ota.checksum = 0;
   g_ota.startMs = millis();
 
-  RTL_INFO(Serial, "[OTA] started: size=%lu\n", (unsigned long)imageSize);
+  RTL_PRINTF(Serial, "[OTA] started: size=%lu\n", (unsigned long)imageSize);
   if (controlClientConnected())
     wsControl.sendTXT(g_controlClientNum, "@ota,ready");
 }
@@ -336,14 +325,14 @@ static void otaWriteChunk(const uint8_t* data, size_t len) {
   const size_t payloadLen = len - 8;
 
   if (chunkLen != payloadLen || (offset + chunkLen) > g_ota.expectedSize) {
-    RTL_INFO(Serial, "[OTA] ERR: bad chunk off=%lu len=%lu payload=%lu\n",
+    RTL_PRINTF(Serial, "[OTA] ERR: bad chunk off=%lu len=%lu payload=%lu\n",
                (unsigned long)offset, (unsigned long)chunkLen, (unsigned long)payloadLen);
     return;
   }
 
   // Flash 기록
   if (flash_stream_write(&g_ota.flash, g_ota.addrNew + offset, chunkLen, (uint8_t*)payload) < 0) {
-    RTL_INFO(Serial, "[OTA] ERR: flash write fail\n");
+    Serial.println("[OTA] ERR: flash write fail");
     if (controlClientConnected())
       wsControl.sendTXT(g_controlClientNum, "@ota,error,flash_write_fail");
     g_ota.active = false;
@@ -361,12 +350,12 @@ static void otaWriteChunk(const uint8_t* data, size_t len) {
 static void otaEnd(uint32_t reportedSize) {
   if (!g_ota.active) return;
 
-  RTL_INFO(Serial, "[OTA] end: received=%lu, expected=%lu, reported=%lu\n",
+  RTL_PRINTF(Serial, "[OTA] end: received=%lu, expected=%lu, reported=%lu\n",
              (unsigned long)g_ota.received, (unsigned long)g_ota.expectedSize,
              (unsigned long)reportedSize);
 
   if (g_ota.received != g_ota.expectedSize || reportedSize != g_ota.expectedSize) {
-    RTL_INFO(Serial, "[OTA] ERR: size mismatch\n");
+    Serial.println("[OTA] ERR: size mismatch");
     // 실패: 새 이미지 무효화, 기존 복원
     flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
     flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
@@ -389,7 +378,7 @@ static void otaEnd(uint32_t reportedSize) {
   }
 
   if (flashChecksum != g_ota.checksum) {
-    RTL_INFO(Serial, "[OTA] ERR: checksum mismatch (ram=%08X flash=%08X)\n",
+    RTL_PRINTF(Serial, "[OTA] ERR: checksum mismatch (ram=%08X flash=%08X)\n",
                (unsigned)g_ota.checksum, (unsigned)flashChecksum);
     flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
     flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
@@ -408,7 +397,7 @@ static void otaEnd(uint32_t reportedSize) {
   flash_read_word(&g_ota.flash, g_ota.addrNew + 0, &s1);
   flash_read_word(&g_ota.flash, g_ota.addrNew + 4, &s2);
   if (s1 != OTA_SIG_VALID || s2 != OTA_SIG_VALID2) {
-    RTL_INFO(Serial, "[OTA] ERR: signature write failed\n");
+    Serial.println("[OTA] ERR: signature write failed");
     g_ota.active = false;
     if (controlClientConnected())
       wsControl.sendTXT(g_controlClientNum, "@ota,error,signature_fail");
@@ -419,7 +408,7 @@ static void otaEnd(uint32_t reportedSize) {
   flash_write_word(&g_ota.flash, g_ota.addrOld + 0, OTA_SIG_INVALID);
 
   const uint32_t elapsed = (millis() - g_ota.startMs) / 1000;
-  RTL_INFO(Serial, "[OTA] SUCCESS: %lu bytes in %lus, checksum=%08X\n",
+  RTL_PRINTF(Serial, "[OTA] SUCCESS: %lu bytes in %lus, checksum=%08X\n",
              (unsigned long)g_ota.received, (unsigned long)elapsed, (unsigned)g_ota.checksum);
   g_ota.active = false;
 
@@ -434,7 +423,7 @@ static void otaEnd(uint32_t reportedSize) {
 // OTA 취소
 static void otaCancel() {
   if (!g_ota.active) return;
-  RTL_INFO(Serial, "[OTA] cancelled\n");
+  Serial.println("[OTA] cancelled");
   // 새 이미지 무효화, 기존 복원
   flash_write_word(&g_ota.flash, g_ota.addrNew, OTA_SIG_INVALID);
   flash_write_word(&g_ota.flash, g_ota.addrOld, OTA_SIG_VALID);
@@ -477,7 +466,7 @@ static bool spiCheckS3Ack(const uint8_t* block) {
       ack->magic[2] != 'M' || ack->magic[3] != '2') return true; // S3 아직 응답 전 (idle) — OK
   if (ack->type == SPI_TYPE_OTA_ACK) {
     if (ack->flags & SPI_FLAG_OTA_ERR) {
-      RTL_INFO(Serial, "[OTA-S3] S3 reported error\n");
+      Serial.println("[OTA-S3] S3 reported error");
       return false;
     }
   }
@@ -534,7 +523,7 @@ static void otaS3Begin(uint32_t imageSize) {
   g_otaS3.startMs = millis();
 
   // 첫 SPI 블록: START flag + 페이로드 0 (S3에게 OTA 시작 알림)
-  RTL_INFO(Serial, "[OTA-S3] start: size=%lu\n", (unsigned long)imageSize);
+  RTL_PRINTF(Serial, "[OTA-S3] start: size=%lu\n", (unsigned long)imageSize);
   if (!spiSendOtaBlock(nullptr, 0, 0, imageSize, SPI_FLAG_START)) {
     g_otaS3.active = false;
     if (controlClientConnected())
@@ -586,7 +575,7 @@ static void otaS3WriteChunk(const uint8_t* data, size_t len) {
 static void otaS3End(uint32_t reportedSize) {
   if (!g_otaS3.active) return;
 
-  RTL_INFO(Serial, "[OTA-S3] end: sent=%lu expected=%lu\n",
+  RTL_PRINTF(Serial, "[OTA-S3] end: sent=%lu expected=%lu\n",
              (unsigned long)g_otaS3.sent, (unsigned long)g_otaS3.expectedSize);
 
   if (g_otaS3.sent != g_otaS3.expectedSize || reportedSize != g_otaS3.expectedSize) {
@@ -617,14 +606,14 @@ static void otaS3End(uint32_t reportedSize) {
       finalAck->type == SPI_TYPE_OTA_ACK &&
       (finalAck->flags & SPI_FLAG_OTA_ERR)) {
     g_otaS3.active = false;
-    RTL_INFO(Serial, "[OTA-S3] S3 reported final error\n");
+    Serial.println("[OTA-S3] S3 reported final error");
     if (controlClientConnected())
       wsControl.sendTXT(g_controlClientNum, "@ota,error,s3_verify_fail");
     return;
   }
 
   const uint32_t elapsed = (millis() - g_otaS3.startMs) / 1000;
-  RTL_INFO(Serial, "[OTA-S3] SUCCESS: %lu bytes in %lus\n",
+  RTL_PRINTF(Serial, "[OTA-S3] SUCCESS: %lu bytes in %lus\n",
              (unsigned long)g_otaS3.sent, (unsigned long)elapsed);
   g_otaS3.active = false;
 
@@ -636,7 +625,7 @@ static void otaS3End(uint32_t reportedSize) {
 // S3 OTA 취소
 static void otaS3Cancel() {
   if (!g_otaS3.active) return;
-  RTL_INFO(Serial, "[OTA-S3] cancelled\n");
+  Serial.println("[OTA-S3] cancelled");
   // END with error flag 전송 (S3가 OTA 포기)
   spiSendOtaBlock(nullptr, 0, 0, 0, SPI_FLAG_END | SPI_FLAG_OTA_ERR);
   g_otaS3.active = false;
@@ -675,7 +664,7 @@ static void enterS3BootMode() {
   digitalWrite(CFG_S3_EN_PIN, HIGH);
   delay(50);
 
-  RTL_INFO(Serial, "[RTL] S3 entered BOOT mode (GPIO0=LOW, EN toggled)\n");
+  Serial.println("[RTL] S3 entered BOOT mode (GPIO0=LOW, EN toggled)");
 }
 
 // S3를 정상 모드로 리셋 (GPIO0=HIGH 상태에서 EN 리셋)
@@ -694,7 +683,7 @@ static void resetS3Normal() {
   pinMode(CFG_S3_BOOT_PIN, INPUT);
   pinMode(CFG_S3_EN_PIN, INPUT);
 
-  RTL_INFO(Serial, "[RTL] S3 reset to NORMAL mode\n");
+  Serial.println("[RTL] S3 reset to NORMAL mode");
 }
 
 // USB↔UART 투명 브릿지 루프
@@ -702,10 +691,10 @@ static void resetS3Normal() {
 // 기본 115200으로 시작, esptool이 change_baud 시 UART도 변경 필요
 // (현재는 고정 보드레이트, 향후 자동 감지 가능)
 static void runPassthruBridge() {
-  RTL_INFO(Serial, "[RTL] === PASSTHRU MODE START ===\n");
-  RTL_INFO(Serial, "[RTL] USB <-> UART transparent bridge active\n");
-  RTL_INFO(Serial, "[RTL] Press Ctrl+C x3 rapidly to force-exit\n");
-  RTL_INFO(Serial, "[RTL] Timeout: %d ms (no data = exit)\n", CFG_PASSTHRU_TIMEOUT_MS);
+  Serial.println("[RTL] === PASSTHRU MODE START ===");
+  Serial.println("[RTL] USB <-> UART transparent bridge active");
+  Serial.println("[RTL] Press Ctrl+C x3 rapidly to force-exit");
+  RTL_PRINTF(Serial, "[RTL] Timeout: %d ms (no data = exit)\n", CFG_PASSTHRU_TIMEOUT_MS);
 
   g_passthruActive = true;
 
@@ -739,7 +728,7 @@ static void runPassthruBridge() {
             if (escHits == 0) escFirstMs = millis();
             escHits++;
             if (escHits >= ESC_COUNT && (millis() - escFirstMs) < ESC_WINDOW_MS) {
-              RTL_INFO(Serial, "\n[RTL] Ctrl+C x3 detected - force exiting passthru\n");
+              Serial.println("\n[RTL] Ctrl+C x3 detected - force exiting passthru");
               g_passthruActive = false;
               break;
             }
@@ -776,7 +765,7 @@ static void runPassthruBridge() {
 
     // 타임아웃 체크
     if (millis() - lastDataTime > CFG_PASSTHRU_TIMEOUT_MS) {
-      RTL_INFO(Serial, "\n[RTL] Passthru timeout - no data, exiting\n");
+      Serial.println("\n[RTL] Passthru timeout - no data, exiting");
       break;
     }
 
@@ -790,28 +779,28 @@ static void runPassthruBridge() {
   Serial1.end();
   Serial1.begin(CFG_LINK_BAUD);
 
-  RTL_INFO(Serial, "[RTL] === PASSTHRU MODE END ===\n");
+  Serial.println("[RTL] === PASSTHRU MODE END ===");
 }
 
 // 패스스루 전체 시퀀스 실행
 static void startPassthruMode() {
-  RTL_INFO(Serial, "[RTL] ========================================\n");
-  RTL_INFO(Serial, "[RTL] S3 Flash Passthrough Mode (Option E)\n");
-  RTL_INFO(Serial, "[RTL] ========================================\n");
+  Serial.println("[RTL] ========================================");
+  Serial.println("[RTL] S3 Flash Passthrough Mode (Option E)");
+  Serial.println("[RTL] ========================================");
   sendSafetyStopToS3();
   delay(50);
-  RTL_INFO(Serial, "[RTL] 1. Entering S3 boot mode...\n");
+  Serial.println("[RTL] 1. Entering S3 boot mode...");
   enterS3BootMode();
 
-  RTL_INFO(Serial, "[RTL] 2. Starting USB<->UART bridge...\n");
-  RTL_INFO(Serial, "[RTL] >>> Use esptool / Arduino IDE to flash S3 now <<<\n");
+  Serial.println("[RTL] 2. Starting USB<->UART bridge...");
+  Serial.println("[RTL] >>> Use esptool / Arduino IDE to flash S3 now <<<");
   runPassthruBridge();
 
-  RTL_INFO(Serial, "[RTL] 3. Resetting S3 to normal mode...\n");
+  Serial.println("[RTL] 3. Resetting S3 to normal mode...");
   resetS3Normal();
 
-  RTL_INFO(Serial, "[RTL] Passthru complete. Resuming normal operation.\n");
-  RTL_INFO(Serial, "[RTL] ========================================\n");
+  Serial.println("[RTL] Passthru complete. Resuming normal operation.");
+  Serial.println("[RTL] ========================================");
 }
 
 #endif // CFG_PASSTHRU_ENABLE
@@ -839,6 +828,12 @@ static void pollCameraClient() {
   if (hasCameraClient && !wsCamera.clientIsConnected(g_cameraClientNum)) {
     hasCameraClient = false;
     g_cameraClientNum = 0xFF;
+    // 스트리밍 중지
+    if (g_streaming) {
+      Serial1.println("@stream,stop");
+      g_streaming = false;
+      g_frameReady = false;
+    }
     sendLedLinkStateToS3(true);
     return;
   }
@@ -895,201 +890,273 @@ static void sendLedLinkStateToS3(bool force) {
 }
 
 // -----------------------------
-// SPI framing (S3 -> RTL)
+// SPI framing (S3 -> RTL): Snap-based
 // -----------------------------
 static_assert(SPI_BLOCK_BYTES >= sizeof(DcmSpiHdr), "SPI block too small for DcmSpiHdr");
 
 // g_spiRx는 파일 상단(SPI link 섹션)에서 이미 선언됨 — OTA + 카메라 공용
 
-// 최신 프레임 캐시(WS 송출용). SPI task가 업데이트하고, WS task가 읽음.
+// 프레임 캐시 (SPI에서 조립 → WS로 송출)
 static uint8_t g_frameBuf[CFG_FRAME_BUF_SIZE];
 static volatile size_t  g_frameLen = 0;
 static volatile uint16_t g_frameSeq = 0;
+// g_frameReady, g_streaming 은 파일 상단에서 선행 선언됨
 
-#if RTL_HAS_FREERTOS
-static SemaphoreHandle_t g_frameMutex = nullptr;
-#endif
+// Snap UART 응답: pumpS3TextToWs()에서 설정, doSnapCycle/manual snap에서 읽음
+static volatile bool     g_snapResponseOk = false;
+static volatile uint32_t g_snapResponseLen = 0;
+static volatile bool     g_snapResponseFail = false;
+static char              g_snapFailReason[64] = "";
 
-static volatile bool g_wantStream = false;
-static volatile uint32_t g_statBlocks = 0;
-static volatile uint32_t g_statFrames = 0;
-static volatile uint32_t g_statBytes = 0;
-// v0.1.2: 에러 통계
-static volatile uint32_t g_statSyncErrors = 0;   // 매직 불일치
-static volatile uint32_t g_statSeqErrors = 0;    // 시퀀스/오프셋 불일치로 드랍
-static volatile uint32_t g_statOversize = 0;     // 프레임 크기 초과로 드랍
-static volatile uint32_t g_statCrcErrors = 0;    // CRC 불일치
+// 간단한 통계 (누적)
+static volatile uint32_t g_snapOkCount = 0;
+static volatile uint32_t g_snapFailCount = 0;
 
-// 통계 스냅샷: 매크로로 정의 (Arduino IDE 전처리기의 자동 프로토타입 생성이
-// struct 정의보다 앞에 놓여 에러 발생하는 문제 회피 — hdrLooksOk과 동일 패턴)
-// 사용법: SNAPSHOT_STATS(로컬변수prefix) → _블럭, _프레임 등 6개 로컬 변수 생성+리셋
-#if RTL_HAS_FREERTOS
-#define SNAPSHOT_AND_RESET_STATS(blk,frm,byt,syncE,seqE,ovs,crcE) \
-  do { \
-    taskENTER_CRITICAL(); \
-    blk  = g_statBlocks;     g_statBlocks     = 0; \
-    frm  = g_statFrames;     g_statFrames     = 0; \
-    byt  = g_statBytes;      g_statBytes      = 0; \
-    syncE = g_statSyncErrors; g_statSyncErrors = 0; \
-    seqE = g_statSeqErrors;  g_statSeqErrors  = 0; \
-    ovs  = g_statOversize;   g_statOversize   = 0; \
-    crcE = g_statCrcErrors;  g_statCrcErrors  = 0; \
-    taskEXIT_CRITICAL(); \
-  } while(0)
-#else
-#define SNAPSHOT_AND_RESET_STATS(blk,frm,byt,syncE,seqE,ovs,crcE) \
-  do { \
-    blk  = g_statBlocks;     g_statBlocks     = 0; \
-    frm  = g_statFrames;     g_statFrames     = 0; \
-    byt  = g_statBytes;      g_statBytes      = 0; \
-    syncE = g_statSyncErrors; g_statSyncErrors = 0; \
-    seqE = g_statSeqErrors;  g_statSeqErrors  = 0; \
-    ovs  = g_statOversize;   g_statOversize   = 0; \
-    crcE = g_statCrcErrors;  g_statCrcErrors  = 0; \
-  } while(0)
-#endif
 
-// 매크로로 정의 (Arduino IDE 전처리기의 자동 프로토타입 생성이
-// struct 정의보다 앞에 놓여 에러 발생하는 문제 회피)
 #define hdrLooksOk(h) \
   ((h).magic[0] == 'D' && (h).magic[1] == 'C' && (h).magic[2] == 'M' && (h).magic[3] == '2')
 
 static bool spiReadBlock(uint8_t* dst, size_t len) {
   if (!dst || len == 0) return false;
 
-  // AmebaD SPI API는 보드별로 구현이 조금 다를 수 있어,
-  // "in-place transfer" 방식으로 최대 호환을 노린다.
-  memset(dst, 0, len);
-
-  // AmebaD SPI는 transfer(pin, void*, count, mode)를 제공하며 내부에서 write+read 스트림을 돌립니다.
-  // byte 단위 루프보다 훨씬 빠릅니다.
+  // 수동 CS + 바이트 단위 전송: AmebaD의 버퍼 일괄 전송이
+  // 수신 데이터를 제대로 저장하지 못하는 문제를 우회.
   SPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  SPI.transfer((byte)SPI_SS_PIN, dst, len, SPI_LAST);
+  digitalWrite(SPI_SS_PIN, LOW);
+  for (size_t i = 0; i < len; i++) {
+    dst[i] = SPI.transfer((uint8_t)0x00);
+  }
+  digitalWrite(SPI_SS_PIN, HIGH);
   SPI.endTransaction();
   return true;
 }
 
-// v0.1.2: 재동기화 상수
-static constexpr uint8_t SPI_MAX_SYNC_RETRIES = 5;   // 연속 매직 불일치 시 리셋까지 허용 횟수
-static constexpr uint8_t SPI_MAX_SEQ_RETRIES  = 3;   // 시퀀스 깨짐 시 프레임 드랍 & 재시작 횟수
-
-static bool pullOneJpegFrameOverSpi(uint32_t timeoutMs) {
+// Snap-based SPI pull: RTL clocks SPI to pull JPEG chunks from S3
+// Called AFTER S3 responded "@snap,ok,<len>" (frame is already captured on S3 side)
+static bool pullSnapFrame(uint32_t expectedTotalLen, uint32_t timeoutMs) {
   const uint32_t start = millis();
-
-  bool haveHeader = false;
+  bool gotStart = false;
   uint16_t curSeq = 0;
-  size_t expectedTotal = 0;
   size_t received = 0;
-  uint8_t syncRetries = 0;
-  uint8_t seqRetries = 0;
 
   while (millis() - start < timeoutMs) {
-    if (!spiReadBlock(g_spiRx, SPI_BLOCK_BYTES)) {
-      delay(1);
-      continue;
-    }
-    g_statBlocks++;
-
+    spiReadBlock(g_spiRx, SPI_BLOCK_BYTES);
     const DcmSpiHdr* hdr = (const DcmSpiHdr*)g_spiRx;
 
+    // Bad magic → S3 queue empty, brief yield
     if (!hdrLooksOk(*hdr)) {
-      g_statSyncErrors++;
-      syncRetries++;
-      if (syncRetries >= SPI_MAX_SYNC_RETRIES) {
-        // v0.1.2: 연속 동기 실패 시 CS 토글로 SPI 라인 리셋 시도
-        digitalWrite(SPI_SS_PIN, HIGH);
-        delay(5);
-        digitalWrite(SPI_SS_PIN, LOW);
-        delay(1);
-        syncRetries = 0;
-        haveHeader = false;
-      }
       delay(1);
       continue;
     }
-    syncRetries = 0; // 매직 OK → 리셋
 
+    // S3 sends IDLE when frame not yet queued
     if (hdr->type == SPI_TYPE_IDLE) {
-      delay(2);
+      delay(1);
       continue;
     }
+
     if (hdr->type != SPI_TYPE_JPEG) {
       continue;
     }
 
-    if (!haveHeader) {
-      if ((hdr->flags & SPI_FLAG_START) == 0 || hdr->offset != 0) {
+    // Expect START flag on first chunk
+    if (!gotStart) {
+      if (!(hdr->flags & SPI_FLAG_START) || hdr->offset != 0) {
+        delay(1);
         continue;
       }
       curSeq = hdr->seq;
-      expectedTotal = hdr->total_len;
       received = 0;
-
-      if (expectedTotal == 0 || expectedTotal > sizeof(g_frameBuf)) {
-        g_statOversize++;
-        haveHeader = false;
-        continue;
-      }
-      haveHeader = true;
-      seqRetries = 0;
+      gotStart = true;
     }
 
-    // 같은 프레임인지 확인
-    if (!haveHeader || hdr->seq != curSeq) {
-      g_statSeqErrors++;
-      seqRetries++;
-      haveHeader = false;
-      if (seqRetries >= SPI_MAX_SEQ_RETRIES) {
-        // v0.1.2: 연속 시퀀스 오류 → 타임아웃 대기 대신 즉시 새 프레임 탐색
-        seqRetries = 0;
-      }
-      continue;
-    }
-    if (hdr->offset != received) {
-      g_statSeqErrors++;
-      haveHeader = false;
+    // Verify sequence and offset continuity
+    if (hdr->seq != curSeq || hdr->offset != received) {
+      RTL_PRINTF(Serial, "[RTL][SPI] seq/off mismatch: expect seq=%u off=%u, got seq=%u off=%u\n",
+                (unsigned)curSeq, (unsigned)received, (unsigned)hdr->seq, (unsigned)hdr->offset);
+      // Reset and try again
+      gotStart = false;
+      received = 0;
       continue;
     }
 
     const size_t pl = hdr->payload_len;
     const size_t headerSz = sizeof(DcmSpiHdr);
-    if (pl > SPI_BLOCK_BYTES - headerSz) { haveHeader = false; continue; }
-    if (hdr->offset + pl > expectedTotal) { haveHeader = false; continue; }
+
+    // Sanity checks
+    if (pl > SPI_BLOCK_BYTES - headerSz || hdr->offset + pl > expectedTotalLen) {
+      gotStart = false;
+      continue;
+    }
+    if (received + pl > sizeof(g_frameBuf)) {
+      RTL_PRINTF(Serial, "[RTL][SPI] frame too large for buffer (%u > %u)\n",
+                (unsigned)(received + pl), (unsigned)sizeof(g_frameBuf));
+      return false;
+    }
+
+    // CRC check
     if (pl > 0) {
       const uint16_t calc = crc16Ccitt(g_spiRx + headerSz, pl);
       if (calc != hdr->crc16) {
-        g_statCrcErrors++;
-        haveHeader = false;
+        RTL_PRINTF(Serial, "[RTL][SPI] CRC mismatch at off=%u (calc=0x%04X rx=0x%04X)\n",
+                  (unsigned)hdr->offset, (unsigned)calc, (unsigned)hdr->crc16);
+        gotStart = false;
         continue;
       }
     }
 
-    // mutex로 memcpy + 메타데이터 갱신을 원자적으로 보호
-    // (WS 태스크의 sendBinary도 mutex 하에 g_frameBuf 읽으므로 레이스 방지)
-#if RTL_HAS_FREERTOS
-    if (RTL_USE_TASKS && g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
-#endif
+    // Copy payload into frame buffer
     memcpy(g_frameBuf + hdr->offset, g_spiRx + headerSz, pl);
     received += pl;
-    g_statBytes += (uint32_t)pl;
 
-    const bool isEnd = (hdr->flags & SPI_FLAG_END) != 0;
-    bool frameComplete = false;
-    if (isEnd && received == expectedTotal) {
-      g_frameLen = expectedTotal;
+    // Frame complete?
+    if ((hdr->flags & SPI_FLAG_END) && received == hdr->total_len) {
+      g_frameLen = received;
       g_frameSeq = curSeq;
-      frameComplete = true;
+      return true;
     }
+
+    // S3 큐 depth=2이므로 다음 블록이 이미 준비되어 있음 → delay 불필요
+  }
+
+  RTL_PRINTF(Serial, "[RTL][SPI] pull timeout: received=%u/%u in %lums\n",
+            (unsigned)received, (unsigned)expectedTotalLen, (unsigned long)(millis() - start));
+  return false;
+}
+
+// Stream SPI pull: UART 핸드셰이크 없이 SPI 헤더만으로 프레임 조립
+// S3가 스트리밍 모드에서 자율적으로 SPI TX 버퍼를 채워줌
+static bool pullStreamFrame(uint32_t timeoutMs) {
+  const uint32_t start = millis();
+  bool gotStart = false;
+  uint16_t curSeq = 0;
+  uint32_t expectedTotal = 0;
+  size_t received = 0;
+
+  while (millis() - start < timeoutMs) {
+    spiReadBlock(g_spiRx, SPI_BLOCK_BYTES);
+    const DcmSpiHdr* hdr = (const DcmSpiHdr*)g_spiRx;
+
+    if (!hdrLooksOk(*hdr)) {
 #if RTL_HAS_FREERTOS
-    if (RTL_USE_TASKS && g_frameMutex) xSemaphoreGive(g_frameMutex);
+      vTaskDelay(1);
+#else
+      delay(1);
 #endif
-    if (frameComplete) {
-      g_statFrames++;
+      continue;
+    }
+
+    if (hdr->type == SPI_TYPE_IDLE) {
+#if RTL_HAS_FREERTOS
+      vTaskDelay(1);
+#else
+      delay(1);
+#endif
+      continue;
+    }
+
+    if (hdr->type != SPI_TYPE_JPEG) continue;
+
+    // START 플래그로 새 프레임 시작 감지
+    if (!gotStart) {
+      if (!(hdr->flags & SPI_FLAG_START) || hdr->offset != 0) continue;
+      curSeq = hdr->seq;
+      expectedTotal = hdr->total_len;
+      received = 0;
+      gotStart = true;
+      if (expectedTotal == 0 || expectedTotal > sizeof(g_frameBuf)) {
+        gotStart = false;
+        continue;
+      }
+    }
+
+    // 시퀀스/오프셋 연속성 확인
+    if (hdr->seq != curSeq || hdr->offset != received) {
+      gotStart = false;
+      received = 0;
+      continue;
+    }
+
+    const size_t pl = hdr->payload_len;
+    const size_t headerSz = sizeof(DcmSpiHdr);
+
+    if (pl > SPI_BLOCK_BYTES - headerSz || received + pl > sizeof(g_frameBuf)) {
+      gotStart = false;
+      received = 0;
+      continue;
+    }
+
+    // CRC 검증
+    if (pl > 0) {
+      const uint16_t calc = crc16Ccitt(g_spiRx + headerSz, pl);
+      if (calc != hdr->crc16) {
+        gotStart = false;
+        received = 0;
+        continue;
+      }
+    }
+
+    memcpy(g_frameBuf + received, g_spiRx + headerSz, pl);
+    received += pl;
+
+    // 프레임 완성?
+    if ((hdr->flags & SPI_FLAG_END) && received == expectedTotal) {
+      g_frameLen = received;
+      g_frameSeq = curSeq;
       return true;
     }
   }
-
   return false;
+}
+
+// Full snap cycle: send UART command → wait response → pull SPI → return success
+static bool doSnapCycle(uint32_t uartTimeoutMs, uint32_t spiTimeoutMs) {
+  // 1. Send snap request to S3
+  g_snapResponseOk = false;
+  g_snapResponseFail = false;
+  Serial1.println("@snap");
+
+  // 2. Wait for UART response from S3
+  //    pumpS3TextToWs()는 taskWsUart에서만 호출 (WebSocket 스레드 안전)
+  //    여기서는 vTaskDelay로 양보하여 taskWsUart가 파싱할 시간을 줌
+  const uint32_t waitStart = millis();
+  while (!g_snapResponseOk && !g_snapResponseFail) {
+    if (millis() - waitStart >= uartTimeoutMs) {
+      g_snapFailCount++;
+      return false;
+    }
+#if RTL_HAS_FREERTOS
+    vTaskDelay(1);
+#else
+    delay(1);
+#endif
+  }
+
+  if (g_snapResponseFail) {
+    RTL_PRINTF(Serial, "[RTL][SNAP] S3 reported failure: %s\n", g_snapFailReason);
+    g_snapFailCount++;
+    return false;
+  }
+
+  const uint32_t totalLen = g_snapResponseLen;
+  if (totalLen == 0 || totalLen > sizeof(g_frameBuf)) {
+    RTL_PRINTF(Serial, "[RTL][SNAP] bad size from S3: %lu (max=%u)\n",
+              (unsigned long)totalLen, (unsigned)sizeof(g_frameBuf));
+    g_snapFailCount++;
+    return false;
+  }
+
+  // 3. S3가 SPI TX 큐를 채울 짧은 시간 (IDLE 블록 2개가 먼저 나오므로 여유 있음)
+  delay(2);
+
+  // 4. Pull frame via SPI
+  if (!pullSnapFrame(totalLen, spiTimeoutMs)) {
+    g_snapFailCount++;
+    return false;
+  }
+
+  g_snapOkCount++;
+  return true;
 }
 
 // WebSocket 콜백: control 서버
@@ -1097,8 +1164,16 @@ static void onControlWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_
   switch (type) {
     case WStype_CONNECTED: {
       const char* path = (payload != nullptr) ? (const char*)payload : "";
-      // 기존 DeepCoConnector 규약: control는 /ws 경로
-      if (strcmp(path, "/ws") != 0) {
+      // 경로 허용: /ws, /ws/, /ws?... (proxy/query 변형 허용)
+      const bool okPath = (length == 3 && strncmp(path, "/ws", 3) == 0) ||
+                          (length >= 4 && strncmp(path, "/ws/", 4) == 0) ||
+                          (length >= 4 && strncmp(path, "/ws?", 4) == 0);
+      if (!okPath) {
+        char dbgPath[64];
+        size_t n = (length < (sizeof(dbgPath) - 1)) ? length : (sizeof(dbgPath) - 1);
+        if (path && n > 0) memcpy(dbgPath, path, n);
+        dbgPath[n] = '\0';
+        RTL_PRINTF(Serial, "[RTL] control WS rejected path='%s' len=%u\n", dbgPath, (unsigned)length);
         wsControl.disconnect(num);
         return;
       }
@@ -1109,7 +1184,7 @@ static void onControlWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_
       }
       g_controlClientNum = num;
       hasControlClient = true;
-      RTL_INFO(Serial, "[RTL] control WS client connected\n");
+      Serial.println("[RTL] control WS client connected");
       sendLedLinkStateToS3(true);
       // 안전: 연결되자마자 stop 한번
       sendSafetyStopToS3();
@@ -1157,6 +1232,14 @@ static void onControlWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_
       // 일반 텍스트 → S3 UART 전달
       static constexpr size_t kMaxFwd = 256;
       const size_t fwdLen = (length > kMaxFwd) ? kMaxFwd : length;
+      // 로봇 명령 도달 모니터링 (WS 제어 명령이 RTL에 도달했는지 확인용)
+      {
+        char cmdBuf[96];
+        size_t n = (fwdLen < (sizeof(cmdBuf) - 1)) ? fwdLen : (sizeof(cmdBuf) - 1);
+        if (payload && n > 0) memcpy(cmdBuf, payload, n);
+        cmdBuf[n] = '\0';
+        RTL_PRINTF(Serial, "[RTL][CMD] %s\n", cmdBuf);
+      }
       Serial1.write(payload, fwdLen);
       Serial1.write('\n');
       break;
@@ -1177,12 +1260,19 @@ static void onControlWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_
 #if ENABLE_CAMERA_BRIDGE
 // WebSocket 콜백: camera 서버
 static void onCameraWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  (void)length;
   switch (type) {
     case WStype_CONNECTED: {
       const char* path = (payload != nullptr) ? (const char*)payload : "";
-      // camera는 "/" 또는 빈 경로를 허용
-      if (!(strcmp(path, "/") == 0 || path[0] == '\0')) {
+      // camera는 "/", 빈 경로, "/?..." 허용
+      const bool okPath = (length == 0) ||
+                          (length == 1 && path[0] == '/') ||
+                          (length >= 2 && path[0] == '/' && path[1] == '?');
+      if (!okPath) {
+        char dbgPath[64];
+        size_t n = (length < (sizeof(dbgPath) - 1)) ? length : (sizeof(dbgPath) - 1);
+        if (path && n > 0) memcpy(dbgPath, path, n);
+        dbgPath[n] = '\0';
+        RTL_PRINTF(Serial, "[RTL] camera WS rejected path='%s' len=%u\n", dbgPath, (unsigned)length);
         wsCamera.disconnect(num);
         return;
       }
@@ -1192,7 +1282,11 @@ static void onCameraWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t
       }
       g_cameraClientNum = num;
       hasCameraClient = true;
-      RTL_INFO(Serial, "[RTL] camera WS client connected\n");
+      Serial.println("[RTL] camera WS client connected");
+      // 스트리밍 시작: S3에게 연속 캡처 모드 요청
+      Serial1.println("@stream,start");
+      g_streaming = true;
+      g_frameReady = false;
       sendLedLinkStateToS3(true);
       break;
     }
@@ -1200,6 +1294,12 @@ static void onCameraWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t
       if (num == g_cameraClientNum) {
         hasCameraClient = false;
         g_cameraClientNum = 0xFF;
+        // 스트리밍 중지
+        if (g_streaming) {
+          Serial1.println("@stream,stop");
+          g_streaming = false;
+          g_frameReady = false;
+        }
         sendLedLinkStateToS3(true);
       }
       break;
@@ -1214,24 +1314,20 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  {
-    static const char* levelNames[] = {"NONE", "INFO", "DEBUG"};
-    RTL_INFO(Serial, "[RTL] DeepCoRTL_Bridge boot (v%s, log=%s)\n",
-               CFG_FW_VERSION, (g_logLevel <= LOG_DEBUG) ? levelNames[g_logLevel] : "?");
-  }
-  RTL_INFO(Serial, "[RTL] Build: %s %s\n", __DATE__, __TIME__);
-  RTL_DEBUG(Serial, "[RTL] Compile detect: RTL_HAS_FREERTOS=%d, defaultTasks=%d\n",
+  Serial.println("[RTL] DeepCoRTL_Bridge boot");
+  RTL_PRINTF(Serial, "[RTL] Build: %s %s\n", __DATE__, __TIME__);
+  RTL_PRINTF(Serial, "[RTL] Compile detect: RTL_HAS_FREERTOS=%d, defaultTasks=%d\n",
                 (int)RTL_HAS_FREERTOS, (int)RTL_USE_TASKS);
-  RTL_DEBUG(Serial, "[RTL] Serial1 pins (fixed by variant): TX=%d(AMB_D4) RX=%d(AMB_D5)\n",
+  RTL_PRINTF(Serial, "[RTL] Serial1 pins (fixed by variant): TX=%d(AMB_D4) RX=%d(AMB_D5)\n",
                 RTL_LINK_TX_PIN, RTL_LINK_RX_PIN);
-  RTL_DEBUG(Serial, "[RTL] SPI pins (fixed by variant): SS=%d(AMB_D9) SCLK=%d(AMB_D10) MISO=%d(AMB_D11) MOSI=%d(AMB_D12)\n",
+  RTL_PRINTF(Serial, "[RTL] SPI pins: SS=%d(CFG_SPI_SS_PIN) SCLK=%d(AMB_D10) MISO=%d(AMB_D11) MOSI=%d(AMB_D12)\n",
                 RTL_SPI_SS_PIN_DOC, RTL_SPI_SCLK_PIN_DOC, RTL_SPI_MISO_PIN_DOC, RTL_SPI_MOSI_PIN_DOC);
 
   // v0.1.5: S3 패스스루용 GPIO 초기화 (입력 모드 = S3가 자유롭게 사용)
 #if CFG_PASSTHRU_ENABLE
   pinMode(CFG_S3_EN_PIN, INPUT);
   pinMode(CFG_S3_BOOT_PIN, INPUT);
-  RTL_DEBUG(Serial, "[RTL] Passthru GPIO: S3_EN=%d(AMB_D8/PA26), S3_BOOT=%d(AMB_D7/PA25)\n",
+  RTL_PRINTF(Serial, "[RTL] Passthru GPIO: S3_EN=%d(AMB_D8/PA26), S3_BOOT=%d(AMB_D7/PA25)\n",
                 CFG_S3_EN_PIN, CFG_S3_BOOT_PIN);
 #endif
 
@@ -1243,40 +1339,70 @@ void setup() {
   pinMode(SPI_SS_PIN, OUTPUT);
   digitalWrite(SPI_SS_PIN, HIGH);
 
-#if RTL_HAS_FREERTOS
-  if (RTL_USE_TASKS) {
-    g_frameMutex = xSemaphoreCreateMutex();
-    if (!g_frameMutex) {
-      RTL_INFO(Serial, "[RTL] WARN: frame mutex create failed, falling back to loop() mode\n");
-      // 강제 폴백 (컴파일 타임 const라서 런타임 변경은 불가) -> mutex 없는 상태로도 동작은 하지만
-      // 데이터 레이스 가능성이 있어, 아래에서는 mutex 존재 여부를 체크하고 사용합니다.
-    }
-  }
-#endif
+  // UART 읽기는 taskWsUart에서만 수행 (WebSocket 스레드 안전성)
 
   // Wi-Fi AP start
+  Serial.println("[RTL][AP] Stage 1: disablePowerSave");
   WiFi.disablePowerSave();
+  Serial.println("[RTL][AP] Stage 2: config static network");
   WiFi.config(AP_IP, AP_DNS, AP_GW, AP_SN);  // AP 모드에도 적용됨(문서)
+  RTL_PRINTF(Serial, "[RTL][AP] Config IP=%d.%d.%d.%d GW=%d.%d.%d.%d SN=%d.%d.%d.%d DNS=%d.%d.%d.%d\n",
+             AP_IP[0], AP_IP[1], AP_IP[2], AP_IP[3],
+             AP_GW[0], AP_GW[1], AP_GW[2], AP_GW[3],
+             AP_SN[0], AP_SN[1], AP_SN[2], AP_SN[3],
+             AP_DNS[0], AP_DNS[1], AP_DNS[2], AP_DNS[3]);
+
+  // NOTE: apbegin() 내부에서 드라이버 init/activate를 수행하므로
+  // wifi_on(RTW_MODE_AP) 선호출은 AP 인터페이스 설정을 꼬이게 할 수 있어 제거.
+  Serial.println("[RTL][AP] Stage 3: skip explicit wifi_on");
 
   char ssid[4 + 8 + 1] = {0};
   buildSsidFromMac(ssid, sizeof(ssid));
+  if (strcmp(ssid, "DCM-00000000") == 0) {
+    // 폴백: 하드웨어 MAC 직접 읽기
+    uint8_t hwmac[6] = {0};
+    wifi_get_mac_address((char*)hwmac);
+    snprintf(ssid, sizeof(ssid), "DCM-%02X%02X%02X%02X", hwmac[2], hwmac[3], hwmac[4], hwmac[5]);
+  }
 
   // 자동 채널 분산: @set,channel 로 수동 설정하지 않은 경우 MAC 기반 자동 선택
   if (g_apChannel == CFG_AP_CHANNEL_DEFAULT) {
     g_apChannel = pickChannelFromMac();
   }
 
-  RTL_INFO(Serial, "[RTL] AP SSID=%s, Channel=%d\n", ssid, g_apChannel);
+  RTL_PRINTF(Serial, "[RTL] AP SSID=%s, Channel=%d\n", ssid, g_apChannel);
 
-  int status = WiFi.apbegin(ssid, g_apPassword, g_apChannel);
+  char chStr[4];
+  snprintf(chStr, sizeof(chStr), "%d", g_apChannel);
+  RTL_PRINTF(Serial, "[RTL][AP] Stage 4: apbegin(ssid=%s, ch=%s, hidden=0, pw_len=%u)\n",
+             ssid, chStr, (unsigned)strlen(g_apPassword));
+  int status = WiFi.apbegin(ssid, g_apPassword, chStr, 0);
+  RTL_PRINTF(Serial, "[RTL][AP] apbegin() status=%d (WL_CONNECTED=%d)\n", status, (int)WL_CONNECTED);
   if (status != WL_CONNECTED) {
-    // AmebaD는 apbegin() 리턴이 status 형태(문서상 "status of AP")
-    RTL_INFO(Serial, "[RTL] apbegin() status = %d\n", status);
+    Serial.println("[RTL][AP] WARN: AP activation failed");
+  } else {
+    Serial.println("[RTL][AP] AP activation success");
+    // AP 활성화 직후 다시 네트워크 설정 적용
+    WiFi.config(AP_IP, AP_DNS, AP_GW, AP_SN);
+    delay(50);
   }
 
   {
-    IPAddress ip = WiFi.localIP();
-    RTL_INFO(Serial, "[RTL] AP IP = %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+    IPAddress ip0 = WiFi.localIP(0);
+    IPAddress gw0 = WiFi.gatewayIP(0);
+    IPAddress sn0 = WiFi.subnetMask(0);
+    RTL_PRINTF(Serial, "[RTL][AP] if0 ip=%d.%d.%d.%d gw=%d.%d.%d.%d sn=%d.%d.%d.%d\n",
+               ip0[0], ip0[1], ip0[2], ip0[3],
+               gw0[0], gw0[1], gw0[2], gw0[3],
+               sn0[0], sn0[1], sn0[2], sn0[3]);
+
+    IPAddress ip1 = WiFi.localIP(1);
+    IPAddress gw1 = WiFi.gatewayIP(1);
+    IPAddress sn1 = WiFi.subnetMask(1);
+    RTL_PRINTF(Serial, "[RTL][AP] if1 ip=%d.%d.%d.%d gw=%d.%d.%d.%d sn=%d.%d.%d.%d\n",
+               ip1[0], ip1[1], ip1[2], ip1[3],
+               gw1[0], gw1[1], gw1[2], gw1[3],
+               sn1[0], sn1[1], sn1[2], sn1[3]);
   }
   // Initial LED link state for S3
   sendLedLinkStateToS3(true);
@@ -1284,24 +1410,25 @@ void setup() {
   // WebSocket servers — config.h
   wsControl.begin();
   wsControl.onEvent(onControlWsEvent);
-  RTL_INFO(Serial, "[RTL] WS control listening on :%d (/ws accepted)\n", CFG_WS_CONTROL_PORT);
+  RTL_PRINTF(Serial, "[RTL] WS control listening on :%d (/ws accepted)\n", CFG_WS_CONTROL_PORT);
 
 #if ENABLE_CAMERA_BRIDGE
   wsCamera.begin();
   wsCamera.onEvent(onCameraWsEvent);
-  RTL_INFO(Serial, "[RTL] WS camera listening on :%d (/ accepted)\n", CFG_WS_CAMERA_PORT);
+  RTL_PRINTF(Serial, "[RTL] WS camera listening on :%d (/ accepted)\n", CFG_WS_CAMERA_PORT);
 #else
-    RTL_INFO(Serial, "[RTL] Camera bridge disabled (ENABLE_CAMERA_BRIDGE=0)\n");
+  Serial.println("[RTL] Camera bridge disabled (ENABLE_CAMERA_BRIDGE=0)");
 #endif
 
 #if RTL_HAS_FREERTOS
   if (RTL_USE_TASKS) {
-    RTL_INFO(Serial, "[RTL] Mode: RTOS tasks (will start on first loop)\n");
+    ensureTasksStartedOnce();
+    Serial.println("[RTL] Mode: RTOS tasks");
   } else {
-    RTL_INFO(Serial, "[RTL] Mode: loop() fallback (RTOS headers not found)\n");
+    Serial.println("[RTL] Mode: RTOS tasks disabled");
   }
 #else
-  RTL_INFO(Serial, "[RTL] Mode: loop() fallback (no RTOS headers)\n");
+  Serial.println("[RTL] Mode: no RTOS (loop is intentionally empty)");
 #endif
 }
 
@@ -1321,7 +1448,7 @@ static void warnRebootIfNeeded() {
   const uint32_t now = millis();
   if (now - lastWarnMs >= 10000) {
     lastWarnMs = now;
-    RTL_INFO(Serial, "[RTL] WARN: settings changed, run @reboot to apply\n");
+    Serial.println("[RTL] WARN: settings changed, run @reboot to apply");
   }
 }
 
@@ -1363,6 +1490,59 @@ static void handleSerialCommand(const char* cmd) {
     delay(200);
     // AmebaD software reset
     NVIC_SystemReset();
+  } else if (strcmp(cmd, "@snap") == 0) {
+    if (g_streaming) {
+      Serial.println("[RTL][SNAP] cannot snap while streaming — disconnect camera client first");
+      return;
+    }
+    // NOTE: 수동 snap은 taskWsUart에서 실행되므로 doSnapCycle()을 쓰면
+    // pumpS3TextToWs()가 돌아갈 수 없어 데드락 발생. 직접 UART를 pump해야 함.
+    Serial.println("[RTL][SNAP] manual snap request");
+    g_snapResponseOk   = false;
+    g_snapResponseFail = false;
+    g_snapFailReason[0] = '\0';
+    Serial1.println("@snap");
+
+    // 대기 루프: 직접 pumpS3TextToWs() 호출하여 응답 파싱
+    const uint32_t snapWaitStart = millis();
+    while (!g_snapResponseOk && !g_snapResponseFail) {
+      if (millis() - snapWaitStart >= 2000) break;   // 2초 타임아웃
+      pumpS3TextToWs();   // 같은 태스크이므로 동시성 문제 없음
+      delay(1);
+    }
+
+    if (g_snapResponseOk && g_snapResponseLen > 0
+        && g_snapResponseLen <= sizeof(g_frameBuf)) {
+      delay(5);  // S3가 SPI TX 버퍼를 채울 시간
+      if (pullSnapFrame(g_snapResponseLen, 1000)) {
+        g_snapOkCount++;
+        RTL_PRINTF(Serial, "[RTL][SNAP] OK seq=%u size=%u bytes\n",
+                  (unsigned)g_frameSeq, (unsigned)g_frameLen);
+        // JPEG 시작 마커 확인 (0xFF 0xD8)
+        const bool isJpeg = (g_frameLen >= 2
+                             && g_frameBuf[0] == 0xFF
+                             && g_frameBuf[1] == 0xD8);
+        RTL_PRINTF(Serial, "[RTL][SNAP] JPEG=%s first4=[%02X %02X %02X %02X]\n",
+                  isJpeg ? "YES" : "NO",
+                  g_frameLen > 0 ? g_frameBuf[0] : 0,
+                  g_frameLen > 1 ? g_frameBuf[1] : 0,
+                  g_frameLen > 2 ? g_frameBuf[2] : 0,
+                  g_frameLen > 3 ? g_frameBuf[3] : 0);
+      } else {
+        g_snapFailCount++;
+        Serial.println("[RTL][SNAP] SPI pull failed");
+      }
+    } else {
+      g_snapFailCount++;
+      if (g_snapResponseOk && g_snapResponseLen > sizeof(g_frameBuf)) {
+        RTL_PRINTF(Serial, "[RTL][SNAP] frame too large: %lu > buf %u\n",
+                  (unsigned long)g_snapResponseLen, (unsigned)sizeof(g_frameBuf));
+      } else if (g_snapResponseFail) {
+        RTL_PRINTF(Serial, "[RTL][SNAP] S3 fail: %s\n", g_snapFailReason);
+      } else {
+        Serial.println("[RTL][SNAP] no UART response from S3 (2s timeout)");
+      }
+    }
   } else if (strcmp(cmd, "@diag") == 0) {
     // v0.1.3: 종합 진단 정보 출력 + WS 전달
     const uint32_t uptimeSec = millis() / 1000;
@@ -1378,8 +1558,9 @@ static void handleSerialCommand(const char* cmd) {
       "\"ws_cam\":%d,"
       "\"frame_seq\":%u,"
       "\"frame_len\":%u,"
+      "\"snap_ok\":%lu,"
+      "\"snap_fail\":%lu,"
 #endif
-      "\"crc_err\":%lu,"
       "\"spi_hz\":%lu,"
       "\"buf_size\":%u,"
       "\"fw_version\":\"%s\","
@@ -1394,8 +1575,9 @@ static void handleSerialCommand(const char* cmd) {
       (int)hasCameraClient,
       (unsigned)g_frameSeq,
       (unsigned)g_frameLen,
+      (unsigned long)g_snapOkCount,
+      (unsigned long)g_snapFailCount,
 #endif
-      (unsigned long)g_statCrcErrors,
       (unsigned long)SPI_HZ,
       (unsigned)sizeof(g_frameBuf),
       CFG_FW_VERSION,
@@ -1407,19 +1589,8 @@ static void handleSerialCommand(const char* cmd) {
       wsControl.sendTXT(g_controlClientNum, diagBuf);
     }
     RTL_PRINTF(Serial, "[RTL] Uptime: %lum %lus\n", (unsigned long)uptimeMin, (unsigned long)(uptimeSec % 60));
-  } else if (strncmp(cmd, "@debug,", 7) == 0) {
-    // v0.1.10: RTL 자체 로그 레벨 변경 (@debug,0/1/2)
-    const char v = cmd[7] ? cmd[7] : '0';
-    const uint8_t newLevel = (uint8_t)(v - '0');
-    g_logLevel = (newLevel <= LOG_DEBUG) ? newLevel : LOG_NONE;
-    {
-      static const char* levelNames[] = {"NONE", "INFO", "DEBUG"};
-      const char* name = (g_logLevel <= LOG_DEBUG) ? levelNames[g_logLevel] : "?";
-      // 강제 출력 (레벨 무관)
-      RTL_PRINTF(Serial, "[RTL] Log level -> %s (%d)\n", name, g_logLevel);
-    }
   } else if (strncmp(cmd, "@s3debug,", 9) == 0) {
-    // v0.1.10: S3 로그 레벨 변경 명령 전달 (@s3debug,0/1/2)
+    // v0.1.3: S3 USB 디버그 토글 명령 전달
     const char v = cmd[9] ? cmd[9] : '0';
     RTL_PRINTF(Serial1, "@debug,%c\n", v);
     RTL_PRINTF(Serial, "[RTL] Sent @debug,%c to S3\n", v);
@@ -1456,7 +1627,7 @@ static void handleSerialCommand(const char* cmd) {
 #endif
   else {
     RTL_PRINTF(Serial, "[RTL] Unknown command: %s\n", cmd);
-    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @debug,0|1|2 / @s3debug,0|1|2 / @diag / @reboot / @info"
+    Serial.println("[RTL] Available: @set,channel,N / @set,password,X / @s3debug,0|1 / @snap / @diag / @reboot / @info"
 #if CFG_PASSTHRU_ENABLE
                    " / @passthru"
 #endif
@@ -1472,9 +1643,15 @@ static void pollUsbSerialCommands() {
     char ch = (char)Serial.read();
     if (ch == '\r') continue;
     if (ch == '\n') {
-      if (usbPos > 0 && usbBuf[0] == '@') {
+      if (usbPos > 0) {
         usbBuf[usbPos] = '\0';
-        handleSerialCommand(usbBuf);
+        if (usbBuf[0] == '@') {
+          handleSerialCommand(usbBuf);
+        } else {
+          // USB Serial에서 받은 일반 로봇 명령을 S3 UART로 전달
+          Serial1.println(usbBuf);
+          RTL_PRINTF(Serial, "[RTL][USB->S3] %s\n", usbBuf);
+        }
       }
       usbPos = 0;
       continue;
@@ -1483,8 +1660,7 @@ static void pollUsbSerialCommands() {
   }
 }
 
-// S3 -> RTL 텍스트(선택): 디버그/상태를 WS로 되돌리고 싶으면 사용
-// char[] 기반 S3→RTL 텍스트 수신 (String 파편화 방지)
+// S3 → RTL 텍스트 수신: UART 응답 파싱 + WS 전달
 static void pumpS3TextToWs() {
   static char s3Buf[256];
   static size_t s3Pos = 0;
@@ -1494,20 +1670,51 @@ static void pumpS3TextToWs() {
     if (ch == '\n') {
       if (s3Pos > 0) {
         s3Buf[s3Pos] = '\0';
-        // 로그 전용 채널: S3가 "@log,"로 보내면 RTL USB 콘솔에 출력
-        if (strncmp(s3Buf, "@log,", 5) == 0) {
+
+        // ---- Snap response parsing ----
+        if (strncmp(s3Buf, "@snap,ok,", 9) == 0) {
+          g_snapResponseLen = (uint32_t)atol(s3Buf + 9);
+          g_snapResponseFail = false;
+          g_snapResponseOk = true;
+          // Don't forward snap protocol messages to WS
+        }
+        else if (strncmp(s3Buf, "@snap,fail", 10) == 0) {
+          // "@snap,fail,<reason>" 에서 reason 추출
+          if (s3Buf[10] == ',') {
+            strncpy(g_snapFailReason, s3Buf + 11, sizeof(g_snapFailReason) - 1);
+            g_snapFailReason[sizeof(g_snapFailReason) - 1] = '\0';
+          } else {
+            strncpy(g_snapFailReason, "unknown", sizeof(g_snapFailReason) - 1);
+          }
+          g_snapResponseFail = true;
+          g_snapResponseOk = false;
+        }
+        // ---- Stream responses ----
+        else if (strncmp(s3Buf, "@stream,ok", 10) == 0) {
+          Serial.println("[RTL][STREAM] S3 acknowledged");
+        }
+        else if (strncmp(s3Buf, "@stream,fail", 12) == 0) {
+          g_streaming = false;
+          g_frameReady = false;
+          Serial.print("[RTL][STREAM] S3 failed: ");
+          if (s3Buf[12] == ',') Serial.println(s3Buf + 13);
+          else Serial.println("unknown");
+        }
+        // ---- Log channel ----
+        else if (strncmp(s3Buf, "@log,", 5) == 0) {
           Serial.print("[S3] ");
           Serial.println(s3Buf + 5);
         }
-        // v0.1.2: 에러 전파 — S3가 "@err,"로 보내면 USB콘솔 + WS로 중계
+        // ---- Error propagation ----
         else if (strncmp(s3Buf, "@err,", 5) == 0) {
           Serial.print("[S3][ERR] ");
           Serial.println(s3Buf + 5);
           if (controlClientConnected()) {
-            wsControl.sendTXT(g_controlClientNum, s3Buf);  // PC에 "@err,코드,메시지" 그대로 전달
+            wsControl.sendTXT(g_controlClientNum, s3Buf);
           }
-        } else {
-          // 그 외 텍스트는 (선택) WS control로 echo
+        }
+        // ---- Other text → WS echo ----
+        else {
           if (controlClientConnected()) {
             wsControl.sendTXT(g_controlClientNum, s3Buf);
           }
@@ -1516,73 +1723,13 @@ static void pumpS3TextToWs() {
       s3Pos = 0;
       continue;
     }
-    // binary 혼입 방지용 제한
     if ((uint8_t)ch >= 0x20 || ch == '\t') {
       if (s3Pos < sizeof(s3Buf) - 1) s3Buf[s3Pos++] = ch;
     }
   }
 }
 
-void loop() {
-#if RTL_HAS_FREERTOS
-  // 첫 loop()에서 task 생성(Arduino core 호환성 확보)
-  ensureTasksStartedOnce();
-#endif
-
-  // RTOS task 모드: 실제 작업은 task에서 수행, loop()는 유휴
-#if RTL_HAS_FREERTOS
-  if (g_tasksEnabledRuntime) {
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-    return;
-  }
-#endif
-
-  // loop() 폴백 모드(기존 동작 유지)
-  pollControlClient();
-
-#if ENABLE_CAMERA_BRIDGE
-  pollCameraClient();
-  g_wantStream = cameraClientConnected();
-
-  // 카메라: SPI로 프레임을 "항상" 받아서 최신 프레임 유지
-  static uint32_t lastPullMs = 0;
-  const uint32_t nowMs = millis();
-  const uint32_t pullIntervalMs = g_wantStream ? 0 : CFG_SPI_IDLE_PULL_MS;
-
-  if (g_wantStream || (nowMs - lastPullMs >= pullIntervalMs)) {
-    lastPullMs = nowMs;
-    const uint16_t beforeSeq = g_frameSeq;
-    if (pullOneJpegFrameOverSpi(g_wantStream ? 120 : 20)) {
-      if (g_wantStream && beforeSeq != g_frameSeq) {
-        // DeepCoConnector는 WS Binary message 1개 = JPEG 1장 전제를 갖고 있음
-        (void)wsCamera.sendBIN(g_cameraClientNum, (const uint8_t*)g_frameBuf, (size_t)g_frameLen);
-      }
-      // wantStream=false면: 최신 프레임만 캐시해두고 송출은 안 함
-    }
-  }
-
-  // 성능 로그: QVGA 30fps 튜닝용
-  static uint32_t lastStatMs = 0;
-  if (nowMs - lastStatMs >= CFG_STAT_INTERVAL_MS) {
-    lastStatMs = nowMs;
-    uint32_t sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs, sCrcE;
-    SNAPSHOT_AND_RESET_STATS(sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs, sCrcE);
-    const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
-    const float fps = (float)sFrm / secs;
-    const float kbps = ((float)sByt / 1024.0f) / secs;
-    RTL_DEBUG(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu crc_err=%lu\n",
-                  fps, (unsigned long)sBlk, kbps,
-                  (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs, (unsigned long)sCrcE);
-  }
-#endif
-
-  // S3 로그/상태 수신
-  pumpS3TextToWs();
-
-  // v0.1.1: USB Serial 설정 명령 처리
-  pollUsbSerialCommands();
-  warnRebootIfNeeded();
-}
+void loop() {}
 
 #if RTL_HAS_FREERTOS
 // -----------------------------
@@ -1590,121 +1737,75 @@ void loop() {
 // -----------------------------
 static void taskWsUart(void* arg) {
   (void)arg;
-  uint16_t lastSentSeq = 0;
-  uint32_t lastStatMs = millis();
-  uint32_t lastBeatMs = millis();
-  uint32_t mallocFailCount = 0;
-  uint32_t lastMallocFailLogMs = 0;
-
   for (;;) {
-    pollControlClient();
+    // ★ UART 파싱 최우선 — snap 응답 빠른 처리
+    pumpS3TextToWs();
+    pollUsbSerialCommands();
 
+    // ★ 프레임 전송: taskSpiPull이 준비한 프레임을 여기서 sendBIN
+    //   모든 WebSocket 호출은 이 태스크에서만 수행 (스레드 안전)
 #if ENABLE_CAMERA_BRIDGE
-    pollCameraClient();
-    g_wantStream = cameraClientConnected();
-
-    // 최신 프레임이 갱신되면 송출
-    if (g_wantStream) {
-      uint16_t curSeq = 0;
-      size_t curLen = 0;
-      bool needSend = false;
-      uint8_t* txBuf = nullptr;
-
-      if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
-      // --- Mutex Critical Section Start ---
-      curSeq = g_frameSeq;
-      curLen = (size_t)g_frameLen;
-
-      if (curLen > 0 && curSeq != lastSentSeq && cameraClientConnected()) {
-        // [개선] 정적 RAM 점유를 피하기 위해 전송 직전에 동적 버퍼 할당
-        // 할당 성공 시: Mutex 구간에서는 memcpy만 수행 후 즉시 해제
-        txBuf = (uint8_t*)malloc(curLen);
-        if (txBuf != nullptr) {
-          memcpy(txBuf, g_frameBuf, curLen);
-          lastSentSeq = curSeq;
-          needSend = true;
-        } else {
-          mallocFailCount++;
-        }
-      }
-      // --- Mutex Critical Section End ---
-      if (g_frameMutex) xSemaphoreGive(g_frameMutex);
-
-      // Mutex 해제 후, 복사된 데이터로 네트워크 전송 수행
-      if (needSend) {
-        (void)wsCamera.sendBIN(g_cameraClientNum, (const uint8_t*)txBuf, curLen);
-        free(txBuf);
-      }
-      const uint32_t nowMs = millis();
-      if (mallocFailCount > 0 && (nowMs - lastMallocFailLogMs) >= 5000) {
-        lastMallocFailLogMs = nowMs;
-        RTL_DEBUG(Serial, "[RTL][WS] WARN: tx malloc failed %lu times\n", (unsigned long)mallocFailCount);
-      }
-    }
-
-    // 성능 로그: SPI task가 stat을 올리고, 출력만 여기서
-    const uint32_t nowMs = millis();
-    if (nowMs - lastStatMs >= CFG_STAT_INTERVAL_MS) {
-      lastStatMs = nowMs;
-      uint32_t sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs, sCrcE;
-      SNAPSHOT_AND_RESET_STATS(sBlk, sFrm, sByt, sSyncE, sSeqE, sOvs, sCrcE);
-      const float secs = (float)CFG_STAT_INTERVAL_MS / 1000.0f;
-      const float fps = (float)sFrm / secs;
-      const float kbps = ((float)sByt / 1024.0f) / secs;
-      RTL_DEBUG(Serial, "[RTL][SPI] fps=%.1f blocks=%lu KB/s=%.1f sync_err=%lu seq_err=%lu oversize=%lu crc_err=%lu\n",
-                    fps, (unsigned long)sBlk, kbps,
-                    (unsigned long)sSyncE, (unsigned long)sSeqE, (unsigned long)sOvs, (unsigned long)sCrcE);
+    if (g_frameReady && cameraClientConnected() && g_frameLen > 0) {
+      (void)wsCamera.sendBIN(g_cameraClientNum, (const uint8_t*)g_frameBuf, g_frameLen);
+      g_frameReady = false;
     }
 #endif
 
-    pumpS3TextToWs();
-    pollUsbSerialCommands();
+    pollControlClient();
+#if ENABLE_CAMERA_BRIDGE
+    pollCameraClient();
+#endif
     warnRebootIfNeeded();
-
-    // 태스크 동작 확인용 하트비트(5초마다)
-    const uint32_t nowBeat = millis();
-    if (nowBeat - lastBeatMs >= 5000) {
-      lastBeatMs = nowBeat;
-      RTL_DEBUG(Serial, "[RTL][TASK] ws_uart alive (wantStream=%d)\n", (int)g_wantStream);
-    }
-
-    // WS/UART은 응답성이 중요: 짧게 양보
     vTaskDelay(1);
   }
 }
 
 static void taskSpiPull(void* arg) {
   (void)arg;
-  uint32_t lastPullMs = 0;
-  uint32_t lastBeatMs = millis();
+  uint32_t lastLogMs = 0;
 
   for (;;) {
 #if ENABLE_CAMERA_BRIDGE
-    const uint32_t nowMs = millis();
-    const uint32_t pullIntervalMs = g_wantStream ? 0 : CFG_SPI_IDLE_PULL_MS;
+    // 스트리밍 모드가 아니거나 카메라 클라이언트 없으면 대기
+    if (!g_streaming || !cameraClientConnected()) {
+      g_frameReady = false;
+      vTaskDelay(50);
+      continue;
+    }
 
-    if (g_wantStream || (nowMs - lastPullMs >= pullIntervalMs)) {
-      lastPullMs = nowMs;
-      (void)pullOneJpegFrameOverSpi(g_wantStream ? 120 : 20);
+    // 이전 프레임이 아직 전송 안 됐으면 기다림 (taskWsUart가 sendBIN 처리)
+    if (g_frameReady) {
+      vTaskDelay(1);
+      continue;
+    }
+
+    // Stream mode: UART 없이 SPI만으로 프레임 pull
+    // S3가 자율적으로 캡처+SPI 큐 → RTL은 SPI 헤더로 프레임 조립
+    if (pullStreamFrame(500)) {
+      g_frameReady = true;  // taskWsUart에게 전송 요청
+      g_snapOkCount++;
     } else {
-      vTaskDelay(5);
+      g_snapFailCount++;
+      vTaskDelay(1);
     }
 
-    // 태스크 동작 확인용 하트비트(5초마다)
-    const uint32_t nowBeat = millis();
-    if (nowBeat - lastBeatMs >= 5000) {
-      lastBeatMs = nowBeat;
-      RTL_DEBUG(Serial, "[RTL][TASK] spi_pull alive (seq=%u len=%u)\n",
-                    (unsigned)g_frameSeq, (unsigned)g_frameLen);
+    // 주기적 로그 (5초마다)
+    const uint32_t nowMs = millis();
+    if (nowMs - lastLogMs >= 5000) {
+      lastLogMs = nowMs;
+      RTL_PRINTF(Serial, "[RTL][CAM] stream_ok=%lu stream_fail=%lu last_seq=%u last_len=%u\n",
+                (unsigned long)g_snapOkCount, (unsigned long)g_snapFailCount,
+                (unsigned)g_frameSeq, (unsigned)g_frameLen);
     }
+
+    vTaskDelay(1);
 #else
     vTaskDelay(50);
 #endif
   }
 }
 
-// Arduino core에 따라 setup() 이후 자동으로 task를 만들 수 있게,
-// 여기서는 "첫 loop()"에서 한번만 생성하는 방식으로 안전하게 동작시킴.
+// loop()를 비우기 위해 task 생성은 setup()에서 1회 수행.
 static void ensureTasksStartedOnce() {
   static bool started = false;
   if (started) return;
@@ -1719,10 +1820,9 @@ static void ensureTasksStartedOnce() {
 
   if (okA == pdPASS && okB == pdPASS) {
     g_tasksStartedRuntime = true;
-    RTL_INFO(Serial, "[RTL] Runtime: tasks started OK (ws_uart + spi_pull)\n");
+    Serial.println("[RTL] Runtime: tasks started OK (ws_uart + spi_pull)");
   } else {
-    g_tasksEnabledRuntime = false;
-    RTL_INFO(Serial, "[RTL] Runtime: task create FAILED (ws_uart=%d spi_pull=%d) -> falling back to loop()\n",
+    RTL_PRINTF(Serial, "[RTL] Runtime: task create FAILED (ws_uart=%d spi_pull=%d)\n",
                   (int)okA, (int)okB);
   }
 }

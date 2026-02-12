@@ -5,6 +5,71 @@
 
 ---
 
+## [v0.2.0] — 2026-02-12 — Snap/Stream 카메라 프로토콜 (UART-free SPI 스트리밍)
+
+### 배경
+- v0.1.x의 연속 SPI 폴링 방식은 S3의 `esp_camera_fb_get()` 블로킹, SPI 큐 언더런, 프레임 동기화 문제로 불안정
+- 카메라 SPI 통신을 전면 재설계하여 두 가지 모드(snap/stream)로 분리
+- AmebaD(RTL8720DN)의 `SPI.transfer()` 버퍼 일괄 전송이 수신 데이터를 올바르게 저장하지 못하는 버그 발견 및 우회
+- WebSocket 라이브러리의 멀티스레드 비안전 문제를 producer-consumer 패턴으로 해결
+
+### Snap 모드 (수동/디버그용)
+- RTL이 UART로 `@snap` 전송 → S3가 프레임 캡처 → `@snap,ok,<len>` UART 응답 → RTL이 SPI pull
+- 1회성 요청-응답 구조, USB 시리얼에서 수동 테스트 가능
+- 실패 사유 전파: S3가 `@snap,fail,<reason>` 응답 (no_camera, capture, busy)
+- RTL `doSnapCycle()`: UART 타임아웃 + SPI pull 타임아웃 관리
+
+### Stream 모드 (웹페이지 카메라 스트리밍)
+- RTL이 카메라 WS 클라이언트 접속 시 `@stream,start` 전송 → S3가 연속 캡처 모드 진입
+- **프레임당 UART 통신 없음** — S3가 `loop()`에서 자율적으로 `esp_camera_fb_get()` → SPI TX 큐잉
+- RTL `pullStreamFrame()`: SPI 헤더의 `total_len`/`START`/`END`/`seq` 필드만으로 프레임 조립
+- WS 클라이언트 해제 시 자동 `@stream,stop` → S3 연속 캡처 중단
+- UART 충돌 문제 완전 제거: `taskSpiPull`은 UART를 전혀 사용하지 않음
+
+### AmebaD SPI 바이트 단위 전송
+- `SPI.transfer(pin, buf, len, mode)` 버퍼 일괄 전송이 RX 데이터를 올바르게 저장하지 못하는 문제 발견
+- `spiReadBlock()`: 수동 `digitalWrite(CS)` + 바이트별 `SPI.transfer(0x00)` 루프로 우회
+- 10MHz에서 안정적 CRC 통과 확인 (7000바이트 패턴 검증)
+
+### Producer-Consumer WebSocket 패턴
+- 기존: `taskSpiPull`에서 `wsCamera.sendBIN()` 직접 호출 → 멀티스레드 충돌로 프리징
+- 변경: `taskSpiPull`(producer)이 `g_frameReady = true` 설정 → `taskWsUart`(consumer)가 `sendBIN()` 수행
+- 모든 WebSocket 호출(`sendBIN`, `loop`)이 단일 태스크(`taskWsUart`)에서만 실행
+
+### S3 펌웨어 간소화
+- v0.1.10의 3단계 로그 시스템, LED 제어, 워치독 등 복잡한 로직 제거
+- 카메라 캡처 + SPI 서빙 핵심 기능만 유지
+- `fillTxBlock()`: 절대 블로킹 없음 (카메라 캡처는 `loop()` 또는 `handleSnap()`에서만)
+- `spiServiceTask`: SPI 트랜잭션 완료 대기 → TX 블록 리필 → 재큐잉
+
+### SPI 프로토콜 (dcm_spi_protocol.h)
+- `SPI_FLAG_IDLE_CAM_NOT_READY`, `SPI_FLAG_IDLE_FB_FAIL` 플래그 제거 (snap/stream에서 불필요)
+- CRC16-CCITT 검증 유지
+- `DcmSpiHdr`: magic("DCM2"), type, flags, seq, total_len, offset, payload_len, crc16 (20바이트)
+
+### UART 명령 체계
+
+| 명령 | 방향 | 용도 |
+|------|------|------|
+| `@snap` | RTL→S3 | 1회 프레임 캡처 요청 |
+| `@snap,ok,<len>` | S3→RTL | 캡처 성공 + 프레임 크기 |
+| `@snap,fail,<reason>` | S3→RTL | 캡처 실패 + 사유 |
+| `@stream,start` | RTL→S3 | 연속 캡처 모드 시작 |
+| `@stream,stop` | RTL→S3 | 연속 캡처 모드 중지 |
+| `@stream,ok` | S3→RTL | 스트림 시작/중지 확인 |
+| `@stream,fail,<reason>` | S3→RTL | 스트림 시작 실패 |
+
+### 변경 파일
+- `esp32s3/DeepCoS3_Robot/DeepCoS3_Robot.ino` — 전면 재작성: snap/stream 핸들러, 자율 캡처 loop, 간소화
+- `esp32s3/DeepCoS3_Robot/config.h` — JPEG 퀄리티 조정, 버전 0.2.0
+- `esp32s3/DeepCoS3_Robot/dcm_spi_protocol.h` — 불필요 플래그 제거
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — pullSnapFrame/pullStreamFrame, doSnapCycle, producer-consumer, 바이트 단위 SPI
+- `rtl8720dn/DeepCoRTL_Bridge/config.h` — 버전 0.2.0
+- `rtl8720dn/DeepCoRTL_Bridge/dcm_spi_protocol.h` — 불필요 플래그 제거
+- `upload_test/mini_dual_firmware_upload.html` — 버전 푸터 갱신
+
+---
+
 ## [v0.1.10] — 2026-02-12 — 3단계 로그 레벨 시스템 (LOG_NONE / LOG_INFO / LOG_DEBUG)
 
 ### 배경

@@ -671,7 +671,9 @@ void WebSocketsServer::handleNewClients(void) {
 #endif
 
 // store new connection
-#if (WEBSOCKETS_NETWORK_TYPE == NETWORK_WIFI_NINA) || (WEBSOCKETS_NETWORK_TYPE == NETWORK_AMEBAD)
+#if (WEBSOCKETS_NETWORK_TYPE == NETWORK_WIFI_NINA)
+        WEBSOCKETS_NETWORK_CLASS * tcpClient = new WEBSOCKETS_NETWORK_CLASS(_server->available());
+#elif (WEBSOCKETS_NETWORK_TYPE == NETWORK_AMEBAD)
         WEBSOCKETS_NETWORK_CLASS * tcpClient = new WEBSOCKETS_NETWORK_CLASS(_server->available());
 #else
     WEBSOCKETS_NETWORK_CLASS * tcpClient = new WEBSOCKETS_NETWORK_CLASS(_server->accept());
@@ -679,6 +681,11 @@ void WebSocketsServer::handleNewClients(void) {
 
         if(!tcpClient) {
             DEBUG_WEBSOCKETS("[WS-Client] creating Network class failed!");
+            return;
+        }
+        // AmebaD: ignore invalid/empty accepted socket
+        if(!(*tcpClient)) {
+            delete tcpClient;
             return;
         }
 
@@ -752,6 +759,10 @@ void WebSocketsServerCore::handleHeader(WSclient_t * client, String * headerLine
         if(headerLine->startsWith("GET ")) {
             // cut URL out
             client->cUrl = headerLine->substring(4, headerLine->indexOf(' ', 4));
+#if (WEBSOCKETS_NETWORK_TYPE == NETWORK_AMEBAD)
+            Serial.print("[WS-HDR] GET line: ");
+            Serial.println(headerLine->c_str());
+#endif
 
             // reset non-websocket http header validation state for this client
             client->cHttpHeadersValid      = true;
@@ -834,6 +845,19 @@ void WebSocketsServerCore::handleHeader(WSclient_t * client, String * headerLine
             }
         }
 
+#if (WEBSOCKETS_NETWORK_TYPE == NETWORK_AMEBAD)
+        Serial.print("[WS-HDR] fin url=");
+        Serial.print(client->cUrl.c_str());
+        Serial.print(" up=");
+        Serial.print((int)client->cIsUpgrade);
+        Serial.print(" ws=");
+        Serial.print((int)client->cIsWebsocket);
+        Serial.print(" key=");
+        Serial.print((client->cKey.length() > 0) ? 1 : 0);
+        Serial.print(" ver=");
+        Serial.println((int)client->cVersion);
+#endif
+
         if(_base64Authorization.length() > 0) {
             String auth = WEBSOCKETS_STRING("Basic ");
             auth += _base64Authorization;
@@ -888,6 +912,18 @@ void WebSocketsServerCore::handleHeader(WSclient_t * client, String * headerLine
             runCbEvent(client->num, WStype_CONNECTED, (uint8_t *)client->cUrl.c_str(), client->cUrl.length());
 
         } else {
+#if (WEBSOCKETS_NETWORK_TYPE == NETWORK_AMEBAD)
+            Serial.print("[WS-HDR] reject url=");
+            Serial.print(client->cUrl.c_str());
+            Serial.print(" up=");
+            Serial.print((int)client->cIsUpgrade);
+            Serial.print(" ws=");
+            Serial.print((int)client->cIsWebsocket);
+            Serial.print(" key=");
+            Serial.print((client->cKey.length() > 0) ? 1 : 0);
+            Serial.print(" ver=");
+            Serial.println((int)client->cVersion);
+#endif
             handleNonWebsocketConnection(client);
         }
     }

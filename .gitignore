@@ -10,6 +10,9 @@ build/
 Thumbs.db
 Desktop.ini
 
+# Generated images (QR codes etc.)
+*.png
+
 # IDE files
 .vscode/
 *.swp

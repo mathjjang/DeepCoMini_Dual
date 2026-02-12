@@ -8,7 +8,8 @@
 #   0x00E000  otadata       8KB
 #   0x010000  ota_0      3968KB  (3.875MB)
 #   0x3F0000  ota_1      3968KB  (3.875MB)
-#   0x7D0000  spiffs      192KB
+#   0x7D0000  coredump     64KB
+#   0x7E0000  spiffs      128KB
 #   0x800000  END
 #
 # Max firmware size: ~3.87MB
@@ -22,8 +23,9 @@
 #   2nd: ota_1 runs -> writes new firmware to ota_0 -> reboot -> ota_0 runs
 #
 # Name,    Type, SubType, Offset,   Size,     Flags
-nvs,       data, nvs,     0x9000,   0x5000,
-otadata,   data, ota,     0xe000,   0x2000,
-ota_0,     app,  ota_0,   0x10000,  0x3E0000,
-ota_1,     app,  ota_1,   0x3F0000, 0x3E0000,
-spiffs,    data, spiffs,  0x7D0000, 0x30000,
+nvs,       data, nvs,      0x9000,   0x5000,
+otadata,   data, ota,      0xe000,   0x2000,
+ota_0,     app,  ota_0,    0x10000,  0x3E0000,
+ota_1,     app,  ota_1,    0x3F0000, 0x3E0000,
+coredump,  data, coredump, 0x7D0000, 0x10000,
+spiffs,    data, spiffs,   0x7E0000, 0x20000,

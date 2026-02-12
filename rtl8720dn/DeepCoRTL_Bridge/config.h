@@ -10,7 +10,7 @@
 // =============================================
 // 펌웨어 버전 (GitHub 태그와 반드시 일치시킬 것)
 // =============================================
-#define CFG_FW_VERSION    "0.2.0"
+#define CFG_FW_VERSION    "0.2.1"
 #define CFG_FW_CHIP       "RTL"
 
 // =============================================
@@ -100,10 +100,13 @@
 #define CFG_ENABLE_CAMERA_BRIDGE  1
 
 // 프레임 버퍼 최대 크기
-// RTL8720DN RAM 제약: BD_RAM_NS 영역 한계로 128KB 불가
-// QVGA(320x240) JPEG @Q10~15 = 3~8KB 이므로 8KB면 충분
+// RTL8720DN RAM 제약: BD_RAM_NS 영역 한계
+// v0.2.1: 더블 버퍼(2개) 적용으로 8KB→6KB 축소
+//   QVGA(320x240) JPEG @Q10~12 = 3~5KB (복잡한 장면 ~6KB)
+//   6KB 초과 프레임은 자동 드롭 (bounds check 처리)
+//   2×6KB=12KB — BD_RAM_NS에 ~1.4KB 여유 확보
 // VGA 해상도는 RTL8720DN에서 지원 불가 (RAM 부족)
-#define CFG_FRAME_BUF_SIZE    (8 * 1024)  // 8KB (QVGA 전용)
+#define CFG_FRAME_BUF_SIZE    (6 * 1024)  // 6KB (QVGA 전용, 더블 버퍼)
 
 // =============================================
 // WebSocket 서버 포트

@@ -5,6 +5,52 @@
 
 ---
 
+## [v0.2.1] — 2026-02-12 — 카메라 FPS 안정화 (19 FPS 평균, 0 FPS 제거)
+
+### 배경
+- v0.2.0에서 카메라 스트리밍 FPS가 22~0 사이를 진동하며 불안정
+- 5개 원인 분석 후 전수 수정: S3 race condition, RTL 대기 낭비, 단일 버퍼, SPI 폴링 한계, 타임아웃 과다
+
+### S3: 뮤텍스 추가 (Fix #1 — Critical)
+- `g_frameMutex` 도입: `g_snapReady`, `g_fb`, `g_fbOff`, `g_frameSeq` 공유 변수 보호
+- 듀얼코어 race condition (double-free, 가비지 포인터) 근본 제거
+- `fillTxBlock()`: 논블로킹 뮤텍스 (`xSemaphoreTake(mutex, 0)`) — 실패 시 IDLE 반환
+- `loop()` 캡처: 블로킹 `esp_camera_fb_get()`은 뮤텍스 밖에서 호출
+
+### RTL: IDLE 대기 제거 (Fix #2 — High)
+- `pullStreamFrame()`, `pullSnapFrame()`: IDLE/bad magic 시 `vTaskDelay(1)` → `taskYIELD()`
+- 프레임 사이 대기 30-50ms → 수ms로 감소
+
+### RTL: 더블 버퍼링 (Fix #3 — High)
+- `g_frameBufA[6KB]` + `g_frameBufB[6KB]` 교대 사용 (포인터 스왑)
+- `taskWsUart`가 `sendBIN` 전에 버퍼 교체 → SPI pull이 sendBIN 중에도 계속 동작
+- 스왑을 `g_frameReady=false` 보다 먼저 수행하여 race-free 보장
+- `CFG_FRAME_BUF_SIZE` 8KB→6KB: BD_RAM_NS 여유 확보 (2×6KB=12KB)
+
+### RTL: pullStreamFrame 개선 (Fix #5 — Medium)
+- 타임아웃 500ms → 100ms: 실패 시 0 FPS 구간 대폭 축소
+- seq 불일치 시 현재 블록이 새 프레임 START이면 즉시 재시작 (1프레임 낭비 제거)
+
+### S3: SPI 폴링 타임아웃 축소 + 큐 깊이 증가 (Fix #4 — Medium)
+- `spi_slave_get_trans_result` 타임아웃: 10ms → 1ms
+- `CFG_SPI_QUEUE_SIZE`: 2 → 3 (RTL 고속 SPI 클럭 대응)
+
+### RTL: FIFO-Batch SPI Read
+- `spiReadBlock()` 재구현: AmebaD 64-entry TX/RX FIFO 직접 레지스터 접근
+- 바이트 단위 2048회 → ~32회 배치 전송 (파이프라인 방식)
+- `spi_api.h` + `extern spi_t spi_obj0` 활용
+
+### 성능 결과
+| 지표 | v0.2.0 | v0.2.1 |
+|------|--------|--------|
+| FPS 범위 | 22~0 (진동) | 13~22 (안정) |
+| 평균 FPS | ~10 | **~19** |
+| stream_fail | 수십~수백 | **1** (시작 시 1회) |
+| 0 FPS 구간 | 반복 발생 | **없음** |
+| 프레임 드롭 | 빈번 | **0** |
+
+---
+
 ## [v0.2.0] — 2026-02-12 — Snap/Stream 카메라 프로토콜 (UART-free SPI 스트리밍)
 
 ### 배경

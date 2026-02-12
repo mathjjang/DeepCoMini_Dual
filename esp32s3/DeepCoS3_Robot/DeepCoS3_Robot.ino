@@ -10,6 +10,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "dcm_spi_protocol.h"
 
 // ==============================================
@@ -83,6 +84,10 @@ static uint16_t g_frameSeq = 0;
 static volatile bool g_snapReady = false;  // true = frame captured, SPI can serve it
 static volatile bool g_streaming = false;  // true = continuous capture mode (no UART per frame)
 
+// v0.2.1: 듀얼코어 Race Condition 방지 뮤텍스
+// loop()(캡처)와 spiServiceTask(TX)가 g_fb/g_fbOff/g_snapReady를 동시 접근하는 것을 보호
+static SemaphoreHandle_t g_frameMutex = nullptr;
+
 static void s3Logf(const char* fmt, ...) {
   char buf[256];
   va_list ap;
@@ -155,69 +160,84 @@ static void configCamera() {
 }
 
 // ---- Snap command handler (called from loop task — blocking OK) ----
+// v0.2.1: 뮤텍스 보호. esp_camera_fb_get()은 블로킹이므로 뮤텍스 밖에서 호출.
 static void handleSnap() {
   if (!g_cameraOk) {
     Serial1.println("@snap,fail,no_camera");
     return;
   }
 
-  // 이전 프레임이 남아있으면 강제 해제
-  if (g_snapReady || g_fb) {
-    if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
-    g_fbOff = 0;
-    g_snapReady = false;
-  }
+  // 이전 프레임이 남아있으면 강제 해제 (뮤텍스 하에)
+  if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
+  if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
+  g_fbOff = 0;
+  g_snapReady = false;
+  if (g_frameMutex) xSemaphoreGive(g_frameMutex);
 
-  // 카메라 프레임 캡처 (blocking OK — loop task)
-  g_fb = esp_camera_fb_get();
-  if (!g_fb || !g_fb->buf || g_fb->len == 0) {
+  // 카메라 프레임 캡처 (blocking OK — loop task, 뮤텍스 밖)
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb || !fb->buf || fb->len == 0) {
     g_camFails++;
-    if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
+    if (fb) esp_camera_fb_return(fb);
     Serial1.println("@snap,fail,capture");
     return;
   }
 
+  // 공유 변수 업데이트 (뮤텍스 하에)
+  uint16_t seq;
+  unsigned long fbLen = (unsigned long)fb->len;
+
+  if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
+  g_fb = fb;
   g_fbOff = 0;
   g_frameSeq++;
   if (g_frameSeq == 0) g_frameSeq = 1;
+  seq = g_frameSeq;
   g_camFrames++;
   g_snapReady = true;
+  if (g_frameMutex) xSemaphoreGive(g_frameMutex);
 
   char resp[32];
-  snprintf(resp, sizeof(resp), "@snap,ok,%lu", (unsigned long)g_fb->len);
+  snprintf(resp, sizeof(resp), "@snap,ok,%lu", fbLen);
   Serial1.println(resp);
 
   // 스트리밍 중 로그 범람 방지: 50프레임마다 또는 첫 프레임만 로그
-  if (g_frameSeq <= 1 || (g_frameSeq % 50) == 0) {
-    s3Logf("[S3][SNAP] seq=%u size=%lu", (unsigned)g_frameSeq, (unsigned long)g_fb->len);
+  if (seq <= 1 || (seq % 50) == 0) {
+    s3Logf("[S3][SNAP] seq=%u size=%lu", (unsigned)seq, fbLen);
   }
 }
 
 // ---- Stream start/stop (called from loop task via UART command) ----
+// v0.2.1: 뮤텍스 보호
 static void handleStreamStart() {
   if (!g_cameraOk) {
     Serial1.println("@stream,fail,no_camera");
     return;
   }
-  // 기존 프레임 정리
+  // 기존 프레임 정리 (뮤텍스 하에)
+  if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
   if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
   g_fbOff = 0;
   g_snapReady = false;
   g_streaming = true;
+  if (g_frameMutex) xSemaphoreGive(g_frameMutex);
   Serial1.println("@stream,ok");
   s3Logf("[S3][STREAM] started");
 }
 
 static void handleStreamStop() {
+  if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
   g_streaming = false;
   if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
   g_fbOff = 0;
   g_snapReady = false;
+  if (g_frameMutex) xSemaphoreGive(g_frameMutex);
   Serial1.println("@stream,ok");
   s3Logf("[S3][STREAM] stopped");
 }
 
 // ---- SPI TX block fill (called from SPI service task — NEVER blocks) ----
+// v0.2.1: g_frameMutex 비차단 잠금으로 loop()/spiServiceTask 동시 접근 보호
 static void fillTxBlock(uint8_t* buf) {
   if (!buf) return;
   memset(buf, 0, SPI_BLOCK_BYTES);
@@ -232,8 +252,14 @@ static void fillTxBlock(uint8_t* buf) {
   h->payload_len = 0;
   h->crc16 = 0;
 
+  // 비차단 잠금 — loop()가 프레임 교체 중이면 IDLE 반환 (SPI 태스크를 블로킹하지 않음)
+  if (!g_frameMutex || xSemaphoreTake(g_frameMutex, 0) != pdTRUE) return;
+
   // 카메라 프레임이 준비되지 않았으면 IDLE 반환
-  if (!g_snapReady || !g_fb) return;
+  if (!g_snapReady || !g_fb) {
+    xSemaphoreGive(g_frameMutex);
+    return;
+  }
 
   const size_t headerSz = sizeof(DcmSpiHdr);
   const size_t maxPayload = SPI_BLOCK_BYTES - headerSz;
@@ -261,6 +287,8 @@ static void fillTxBlock(uint8_t* buf) {
     g_fbOff = 0;
     g_snapReady = false;
   }
+
+  xSemaphoreGive(g_frameMutex);
 }
 
 static bool spiSlaveInit() {
@@ -606,6 +634,13 @@ void setup() {
   s3Logf("[S3][MOTOR] INIT L=%d R=%d", stepperLeft ? 1 : 0, stepperRight ? 1 : 0);
   s3Logf("[S3][READY] commands: stop, forward, left, right, move, angle, robot");
   configCamera();
+
+  // v0.2.1: 프레임 공유 변수 보호 뮤텍스 생성 (SPI 초기화 전에)
+  g_frameMutex = xSemaphoreCreateMutex();
+  if (!g_frameMutex) {
+    s3Logf("[S3][ERR] frameMutex create fail!");
+  }
+
   g_spiOk = spiSlaveInit();
   xTaskCreate(spiServiceTask, "spi_service", 6144, NULL, 2, &g_spiTaskHandle);
   s3Logf("[S3][CAM] spi_service started (spi=%d cam=%d)", g_spiOk ? 1 : 0, g_cameraOk ? 1 : 0);
@@ -621,22 +656,39 @@ void loop() {
   }
 
   // Stream mode: 이전 프레임이 SPI로 전송 완료되면 자동으로 다음 프레임 캡처
-  // UART 응답 없음 — SPI 헤더만으로 RTL이 프레임을 조립
-  if (g_streaming && !g_snapReady && g_cameraOk) {
-    if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
-    g_fb = esp_camera_fb_get();  // blocking OK (loop task)
-    if (g_fb && g_fb->buf && g_fb->len > 0) {
-      g_fbOff = 0;
-      g_frameSeq++;
-      if (g_frameSeq == 0) g_frameSeq = 1;
-      g_camFrames++;
-      g_snapReady = true;
+  // v0.2.1: 뮤텍스 보호 — esp_camera_fb_get()은 블로킹이므로 뮤텍스 밖에서 호출
+  if (g_streaming && g_cameraOk) {
+    // (1) 뮤텍스 하에 g_snapReady 확인
+    bool needCapture = false;
+    if (g_frameMutex && xSemaphoreTake(g_frameMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      needCapture = !g_snapReady;
+      xSemaphoreGive(g_frameMutex);
+    }
+
+    if (needCapture) {
+      // (2) 카메라 캡처 — 뮤텍스 밖 (blocking OK, loop task)
+      camera_fb_t* fb = esp_camera_fb_get();
+
+      if (fb && fb->buf && fb->len > 0) {
+        // (3) 뮤텍스 하에 공유 변수 업데이트
+        if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
+        if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
+        g_fb = fb;
+        g_fbOff = 0;
+        g_frameSeq++;
+        if (g_frameSeq == 0) g_frameSeq = 1;
+        g_camFrames++;
+        g_snapReady = true;
+        if (g_frameMutex) xSemaphoreGive(g_frameMutex);
+      } else {
+        g_camFails++;
+        if (fb) esp_camera_fb_return(fb);
+      }
     } else {
-      g_camFails++;
-      if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
+      delay(1);  // g_snapReady==true → SPI가 전송 완료할 때까지 yield
     }
   } else {
-    delay(1);  // 스트리밍 중 아닐 때만 yield (esp_camera_fb_get이 자체 yield)
+    delay(1);  // 스트리밍 중 아닐 때만 yield
   }
 }
 

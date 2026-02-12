@@ -33,12 +33,17 @@
 #endif
 #include "src/dc_ws/WebSocketsServer.h" // project-local copy (no global library patch)
 
-// Realtek/Ameba low-level Wi-Fi API (AP client list) + Flash OTA API
+// Realtek/Ameba low-level Wi-Fi API (AP client list) + Flash OTA API + SPI register access
 extern "C" {
   #include "wifi_conf.h"
   #include "flash_api.h"
   #include "sys_api.h"
+  #include "spi_api.h"         // spi_t, MBED_SPIx 등 SPI HAL 타입
 }
+
+// Arduino SPI.cpp에서 정의된 SPI 오브젝트 (BW16: spi_obj0 → MBED_SPI1)
+// FIFO-batch 레지스터 접근 시 SPI 인덱스/베이스 주소 결정에 사용
+extern spi_t spi_obj0;
 
 // -------------------------------------------------------
 // Ameba RTL8720DN: LOGUARTClass / UARTClassTwo에 printf()가 없음
@@ -897,7 +902,13 @@ static_assert(SPI_BLOCK_BYTES >= sizeof(DcmSpiHdr), "SPI block too small for Dcm
 // g_spiRx는 파일 상단(SPI link 섹션)에서 이미 선언됨 — OTA + 카메라 공용
 
 // 프레임 캐시 (SPI에서 조립 → WS로 송출)
-static uint8_t g_frameBuf[CFG_FRAME_BUF_SIZE];
+// v0.2.1 더블 버퍼: sendBIN 중에도 SPI pull 병행 가능
+//   taskSpiPull  → g_frameBuf(현재 포인터)에 프레임 조립
+//   taskWsUart   → sendBIN 전에 g_frameBuf를 다른 쪽으로 교체
+//                   → SPI는 교체된 버퍼에 즉시 다음 프레임 시작
+static uint8_t g_frameBufA[CFG_FRAME_BUF_SIZE];
+static uint8_t g_frameBufB[CFG_FRAME_BUF_SIZE];
+static uint8_t* g_frameBuf = g_frameBufA;  // SPI pull 조립 대상
 static volatile size_t  g_frameLen = 0;
 static volatile uint16_t g_frameSeq = 0;
 // g_frameReady, g_streaming 은 파일 상단에서 선행 선언됨
@@ -916,16 +927,58 @@ static volatile uint32_t g_snapFailCount = 0;
 #define hdrLooksOk(h) \
   ((h).magic[0] == 'D' && (h).magic[1] == 'C' && (h).magic[2] == 'M' && (h).magic[3] == '2')
 
+// ---------------------------------------------------------------
+// FIFO-Batch SPI Read (v0.2.1)
+// ---------------------------------------------------------------
+// AmebaD Arduino SPI.transfer(buf,len) 버그 원인:
+//   1) spi_master_write_read_stream()에 동일 버퍼를 TX/RX로 전달
+//   2) 인터럽트 기반 비동기 함수인데 완료 대기 없이 CS 해제
+//
+// 해결: SPI.transfer(byte) 와 동일한 레지스터 직접 접근을 유지하되,
+// 64-entry TX/RX FIFO를 파이프라인으로 활용하여 ~10-30x 속도 향상.
+//   Phase 1: TX FIFO에 0x00을 최대 64바이트까지 일괄 채움
+//   Phase 2: RX FIFO에서 수신 데이터 일괄 회수
+//   → TX FIFO가 빠지 않는 한 SPI 클럭이 연속으로 유지됨
+//
+// Register offsets (DW_apb_ssi):
+//   SR  = 0x28  : Status Register
+//   DR  = 0x60  : Data Register (TX write / RX read)
+// SR bits:
+//   TFNF (bit 1, 0x02) : TX FIFO Not Full
+//   RFNE (bit 3, 0x08) : RX FIFO Not Empty
+// ---------------------------------------------------------------
 static bool spiReadBlock(uint8_t* dst, size_t len) {
   if (!dst || len == 0) return false;
 
-  // 수동 CS + 바이트 단위 전송: AmebaD의 버퍼 일괄 전송이
-  // 수신 데이터를 제대로 저장하지 못하는 문제를 우회.
+  // SPI 레지스터 베이스 주소 결정 (SPI.cpp의 transfer(byte)와 동일 방식)
+  const u8 spi_idx = spi_obj0.spi_idx & 0x0F;
+  const u32 spi_addr = (spi_idx == MBED_SPI0) ? SPI0_REG_BASE : SPI1_REG_BASE;
+
   SPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(SPI_SS_PIN, LOW);
-  for (size_t i = 0; i < len; i++) {
-    dst[i] = SPI.transfer((uint8_t)0x00);
+
+  size_t txSent = 0, rxRecv = 0;
+
+  while (rxRecv < len) {
+    // Phase 1: TX FIFO 채움 — 최대 64바이트 ahead (RX FIFO 오버플로 방지)
+    while (txSent < len && (txSent - rxRecv) < 64) {
+      if (HAL_READ32(spi_addr, 0x28) & 0x02) {   // TFNF
+        HAL_WRITE32(spi_addr, 0x60, 0x00);
+        txSent++;
+      } else {
+        break;
+      }
+    }
+    // Phase 2: RX FIFO 회수
+    while (rxRecv < txSent) {
+      if (HAL_READ32(spi_addr, 0x28) & 0x08) {   // RFNE
+        dst[rxRecv++] = (uint8_t)HAL_READ32(spi_addr, 0x60);
+      } else {
+        break;
+      }
+    }
   }
+
   digitalWrite(SPI_SS_PIN, HIGH);
   SPI.endTransaction();
   return true;
@@ -943,15 +996,22 @@ static bool pullSnapFrame(uint32_t expectedTotalLen, uint32_t timeoutMs) {
     spiReadBlock(g_spiRx, SPI_BLOCK_BYTES);
     const DcmSpiHdr* hdr = (const DcmSpiHdr*)g_spiRx;
 
-    // Bad magic → S3 queue empty, brief yield
+    // v0.2.1: delay(1) → yield — 폴링 속도 향상
     if (!hdrLooksOk(*hdr)) {
-      delay(1);
+#if RTL_HAS_FREERTOS
+      taskYIELD();
+#else
+      yield();
+#endif
       continue;
     }
 
-    // S3 sends IDLE when frame not yet queued
     if (hdr->type == SPI_TYPE_IDLE) {
-      delay(1);
+#if RTL_HAS_FREERTOS
+      taskYIELD();
+#else
+      yield();
+#endif
       continue;
     }
 
@@ -962,7 +1022,6 @@ static bool pullSnapFrame(uint32_t expectedTotalLen, uint32_t timeoutMs) {
     // Expect START flag on first chunk
     if (!gotStart) {
       if (!(hdr->flags & SPI_FLAG_START) || hdr->offset != 0) {
-        delay(1);
         continue;
       }
       curSeq = hdr->seq;
@@ -988,9 +1047,9 @@ static bool pullSnapFrame(uint32_t expectedTotalLen, uint32_t timeoutMs) {
       gotStart = false;
       continue;
     }
-    if (received + pl > sizeof(g_frameBuf)) {
+    if (received + pl > CFG_FRAME_BUF_SIZE) {
       RTL_PRINTF(Serial, "[RTL][SPI] frame too large for buffer (%u > %u)\n",
-                (unsigned)(received + pl), (unsigned)sizeof(g_frameBuf));
+                (unsigned)(received + pl), (unsigned)CFG_FRAME_BUF_SIZE);
       return false;
     }
 
@@ -1026,6 +1085,12 @@ static bool pullSnapFrame(uint32_t expectedTotalLen, uint32_t timeoutMs) {
 
 // Stream SPI pull: UART 핸드셰이크 없이 SPI 헤더만으로 프레임 조립
 // S3가 스트리밍 모드에서 자율적으로 SPI TX 버퍼를 채워줌
+//
+// v0.2.1 설계:
+//   - 타임아웃 = S3가 아무 데이터도 안 보낼 때 무한 폴링 방지용 (최후 수단)
+//   - 조립 실패(CRC, 시퀀스 불일치) → 즉시 해당 프레임 drop, 다음 START 탐색
+//   - seq 불일치 시 현재 블록이 새 프레임의 START이면 즉시 새 프레임 시작
+//     (이전: 무조건 버림 → 1프레임 분량(30-50ms) 낭비)
 static bool pullStreamFrame(uint32_t timeoutMs) {
   const uint32_t start = millis();
   bool gotStart = false;
@@ -1039,54 +1104,64 @@ static bool pullStreamFrame(uint32_t timeoutMs) {
 
     if (!hdrLooksOk(*hdr)) {
 #if RTL_HAS_FREERTOS
-      vTaskDelay(1);
+      taskYIELD();
 #else
-      delay(1);
+      yield();
 #endif
       continue;
     }
 
     if (hdr->type == SPI_TYPE_IDLE) {
 #if RTL_HAS_FREERTOS
-      vTaskDelay(1);
+      taskYIELD();
 #else
-      delay(1);
+      yield();
 #endif
       continue;
     }
 
     if (hdr->type != SPI_TYPE_JPEG) continue;
 
+    // ── 새 프레임 START 감지 (공통 헬퍼 매크로) ──
+    // gotStart==false 이거나, 조립 중 seq 불일치로 재시작할 때 모두 사용
+    #define TRY_BEGIN_FRAME() do { \
+      if ((hdr->flags & SPI_FLAG_START) && hdr->offset == 0 \
+          && hdr->total_len > 0 && hdr->total_len <= CFG_FRAME_BUF_SIZE) { \
+        curSeq = hdr->seq; \
+        expectedTotal = hdr->total_len; \
+        received = 0; \
+        gotStart = true; \
+      } else { \
+        gotStart = false; \
+        received = 0; \
+        continue; \
+      } \
+    } while(0)
+
     // START 플래그로 새 프레임 시작 감지
     if (!gotStart) {
-      if (!(hdr->flags & SPI_FLAG_START) || hdr->offset != 0) continue;
-      curSeq = hdr->seq;
-      expectedTotal = hdr->total_len;
-      received = 0;
-      gotStart = true;
-      if (expectedTotal == 0 || expectedTotal > sizeof(g_frameBuf)) {
-        gotStart = false;
-        continue;
-      }
+      TRY_BEGIN_FRAME();
     }
 
     // 시퀀스/오프셋 연속성 확인
+    // ★ seq 불일치 시: 현재 블록이 새 프레임 START이면 즉시 재시작
+    //    (이전: 무조건 drop → 다음 프레임 START까지 ~30-50ms 대기)
     if (hdr->seq != curSeq || hdr->offset != received) {
-      gotStart = false;
-      received = 0;
-      continue;
+      TRY_BEGIN_FRAME();  // 새 START면 즉시 시작, 아니면 drop+continue
     }
+
+    #undef TRY_BEGIN_FRAME
 
     const size_t pl = hdr->payload_len;
     const size_t headerSz = sizeof(DcmSpiHdr);
 
-    if (pl > SPI_BLOCK_BYTES - headerSz || received + pl > sizeof(g_frameBuf)) {
+    if (pl > SPI_BLOCK_BYTES - headerSz || received + pl > CFG_FRAME_BUF_SIZE) {
       gotStart = false;
       received = 0;
       continue;
     }
 
-    // CRC 검증
+    // CRC 검증 — 실패 시 이 프레임 즉시 drop, 다음 START 탐색
     if (pl > 0) {
       const uint16_t calc = crc16Ccitt(g_spiRx + headerSz, pl);
       if (calc != hdr->crc16) {
@@ -1139,9 +1214,9 @@ static bool doSnapCycle(uint32_t uartTimeoutMs, uint32_t spiTimeoutMs) {
   }
 
   const uint32_t totalLen = g_snapResponseLen;
-  if (totalLen == 0 || totalLen > sizeof(g_frameBuf)) {
+  if (totalLen == 0 || totalLen > CFG_FRAME_BUF_SIZE) {
     RTL_PRINTF(Serial, "[RTL][SNAP] bad size from S3: %lu (max=%u)\n",
-              (unsigned long)totalLen, (unsigned)sizeof(g_frameBuf));
+              (unsigned long)totalLen, (unsigned)CFG_FRAME_BUF_SIZE);
     g_snapFailCount++;
     return false;
   }
@@ -1512,7 +1587,7 @@ static void handleSerialCommand(const char* cmd) {
     }
 
     if (g_snapResponseOk && g_snapResponseLen > 0
-        && g_snapResponseLen <= sizeof(g_frameBuf)) {
+        && g_snapResponseLen <= CFG_FRAME_BUF_SIZE) {
       delay(5);  // S3가 SPI TX 버퍼를 채울 시간
       if (pullSnapFrame(g_snapResponseLen, 1000)) {
         g_snapOkCount++;
@@ -1534,9 +1609,9 @@ static void handleSerialCommand(const char* cmd) {
       }
     } else {
       g_snapFailCount++;
-      if (g_snapResponseOk && g_snapResponseLen > sizeof(g_frameBuf)) {
+      if (g_snapResponseOk && g_snapResponseLen > CFG_FRAME_BUF_SIZE) {
         RTL_PRINTF(Serial, "[RTL][SNAP] frame too large: %lu > buf %u\n",
-                  (unsigned long)g_snapResponseLen, (unsigned)sizeof(g_frameBuf));
+                  (unsigned long)g_snapResponseLen, (unsigned)CFG_FRAME_BUF_SIZE);
       } else if (g_snapResponseFail) {
         RTL_PRINTF(Serial, "[RTL][SNAP] S3 fail: %s\n", g_snapFailReason);
       } else {
@@ -1579,7 +1654,7 @@ static void handleSerialCommand(const char* cmd) {
       (unsigned long)g_snapFailCount,
 #endif
       (unsigned long)SPI_HZ,
-      (unsigned)sizeof(g_frameBuf),
+      (unsigned)CFG_FRAME_BUF_SIZE,
       CFG_FW_VERSION,
       (int)g_ota.active,
       (int)g_otaS3.active
@@ -1744,10 +1819,22 @@ static void taskWsUart(void* arg) {
 
     // ★ 프레임 전송: taskSpiPull이 준비한 프레임을 여기서 sendBIN
     //   모든 WebSocket 호출은 이 태스크에서만 수행 (스레드 안전)
+    //
+    //   v0.2.1 더블 버퍼:
+    //     1) 로컬에 포인터/길이 저장
+    //     2) g_frameBuf를 다른 버퍼로 교체 (SPI가 쓸 새 버퍼 확보)
+    //     3) g_frameReady = false  (SPI task 즉시 재개 가능)
+    //     4) sendBIN — 이 동안 SPI는 교체된 버퍼에 다음 프레임 조립
+    //   ⚠ 교체(swap)를 g_frameReady=false 보다 반드시 먼저 수행해야
+    //     SPI가 깨어났을 때 올바른(비어 있는) 버퍼에 쓸 수 있음
 #if ENABLE_CAMERA_BRIDGE
     if (g_frameReady && cameraClientConnected() && g_frameLen > 0) {
-      (void)wsCamera.sendBIN(g_cameraClientNum, (const uint8_t*)g_frameBuf, g_frameLen);
-      g_frameReady = false;
+      const uint8_t* buf = (const uint8_t*)g_frameBuf;
+      const size_t   len = g_frameLen;
+      // 교체 먼저 → SPI가 깨어나면 새 버퍼에 조립
+      g_frameBuf = (g_frameBuf == g_frameBufA) ? g_frameBufB : g_frameBufA;
+      g_frameReady = false;   // SPI task 해제 (교체 뒤!)
+      (void)wsCamera.sendBIN(g_cameraClientNum, buf, len);
     }
 #endif
 
@@ -1773,20 +1860,21 @@ static void taskSpiPull(void* arg) {
       continue;
     }
 
-    // 이전 프레임이 아직 전송 안 됐으면 기다림 (taskWsUart가 sendBIN 처리)
+    // 이전 프레임이 아직 전송 안 됐으면 대기
+    // v0.2.1 더블 버퍼: taskWsUart가 교체+해제하면 즉시 재개
     if (g_frameReady) {
-      vTaskDelay(1);
+      taskYIELD();
       continue;
     }
 
     // Stream mode: UART 없이 SPI만으로 프레임 pull
     // S3가 자율적으로 캡처+SPI 큐 → RTL은 SPI 헤더로 프레임 조립
-    if (pullStreamFrame(500)) {
+    if (pullStreamFrame(100)) {   // v0.2.1: 타임아웃 500→100ms
       g_frameReady = true;  // taskWsUart에게 전송 요청
       g_snapOkCount++;
     } else {
       g_snapFailCount++;
-      vTaskDelay(1);
+      taskYIELD();
     }
 
     // 주기적 로그 (5초마다)

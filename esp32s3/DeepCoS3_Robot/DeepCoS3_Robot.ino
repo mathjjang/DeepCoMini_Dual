@@ -34,6 +34,7 @@ bool stepRight_flag = false;
 bool quick_stop_flag = false;
 
 const float maxSpeedLimit = CFG_MAX_SPEED_LIMIT; // SPS
+int storedSpeed = 0;  // Joy protocol: stored speed (-100~100), set via "speed,N"
 
 // ==============================================
 // Camera standalone test (Stage 1)
@@ -452,6 +453,60 @@ void robotMove(const char* command) {
   }
 }
 
+// Joy protocol: uses storedSpeed (set via "speed,N") + x from "joy,{x:N}"
+// Proportional scaling preserves vL/vR ratio → turning radius independent of speed.
+void joyMove(const char* command) {
+  if (!command) return;
+  JsonDocument doc;
+  deserializeJson(doc, command);
+  int x = doc["x"];           // -100 ~ 100
+
+  Serial.printf("[JOY] x=%d, storedSpeed=%d\n", x, storedSpeed);
+
+  // storedSpeed == 0 → safe stop (e.g. after boot, before speed is set)
+  if (storedSpeed == 0) {
+    stop();
+    return;
+  }
+
+  float baseSpeed = (abs(storedSpeed) / 100.0f) * maxSpeedLimit;
+  float turnGain = 0.6f;     // steering sensitivity (0.0 ~ 1.0)
+  float fx = x / 100.0f;     // normalized steering
+
+  // Differential drive conversion
+  float vL_raw = baseSpeed * (1.0f + turnGain * fx);
+  float vR_raw = baseSpeed * (1.0f - turnGain * fx);
+
+  // Proportional scaling: preserve vL/vR ratio → preserve turning radius
+  float maxVal = max(fabs(vL_raw), fabs(vR_raw));
+  float vL, vR;
+  if (maxVal > maxSpeedLimit) {
+    float scale = (float)maxSpeedLimit / maxVal;
+    vL = vL_raw * scale;
+    vR = vR_raw * scale;
+    Serial.printf("[JOY] proportional scale=%.2f -> vL=%.0f, vR=%.0f\n",
+                  scale, vL, vR);
+  } else {
+    vL = vL_raw;
+    vR = vR_raw;
+  }
+
+  // Direction: determined by storedSpeed sign
+  bool forward = (storedSpeed > 0);
+
+  motor_sync = false;
+  if (stepperLeft) {
+    stepperLeft->setSpeedInHz(fabs(vL));
+    if (forward) stepperLeft->runForward();
+    else stepperLeft->runBackward();
+  }
+  if (stepperRight) {
+    stepperRight->setSpeedInHz(fabs(vR));
+    if (forward) stepperRight->runBackward();
+    else stepperRight->runForward();
+  }
+}
+
 static void handleCommandLine(const char* line) {
   if (!line || !line[0]) return;
   Serial.printf("[S3][CMD-IN] %s\n", line);
@@ -475,6 +530,19 @@ static void handleCommandLine(const char* line) {
   const size_t keyLen = (size_t)(comma - line);
   const char* value = comma + 1;
 
+  // ── Joy protocol: speed + joy separated commands ──
+  if (keyLen == 5 && strncmp(line, "speed", 5) == 0) {
+    storedSpeed = atoi(value);
+    if (storedSpeed > 100) storedSpeed = 100;
+    if (storedSpeed < -100) storedSpeed = -100;
+    Serial.printf("[SPEED] stored=%d\n", storedSpeed);
+    return;
+  }
+  if (keyLen == 3 && strncmp(line, "joy", 3) == 0) {
+    joyMove(value);
+    return;
+  }
+  // ── Existing: robot command (unchanged) ──
   if (keyLen == 5 && strncmp(line, "robot", 5) == 0) {
     robotMove(value);
     return;
@@ -632,7 +700,7 @@ void setup() {
   }
 
   s3Logf("[S3][MOTOR] INIT L=%d R=%d", stepperLeft ? 1 : 0, stepperRight ? 1 : 0);
-  s3Logf("[S3][READY] commands: stop, forward, left, right, move, angle, robot");
+  s3Logf("[S3][READY] commands: stop, forward, left, right, move, angle, robot, speed, joy");
   configCamera();
 
   // v0.2.1: 프레임 공유 변수 보호 뮤텍스 생성 (SPI 초기화 전에)

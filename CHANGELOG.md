@@ -5,6 +5,37 @@
 
 ---
 
+## [v0.2.2] — 2026-02-14 — Joy 프로토콜 + SPI 핀 재배치 + 문서 정비
+
+### S3: Joy 프로토콜 추가 (DeepCoS3_Robot.ino)
+- `speed,N` 명령: 속도 저장 (-100 ~ 100, 음수=후진)
+- `joy,{x:N}` 명령: 조이스틱 방향 입력 (-100 ~ 100)
+- `joyMove()`: 비례 스케일링 기반 차동 구동 (turning radius 유지)
+- `storedSpeed` 전역 변수로 속도 상태 관리
+- `handleCommandLine()`: "speed" / "joy" 명령 파서 추가
+- 부팅 메시지에 `speed`, `joy` 명령 추가 표시
+
+### S3: SPI 핀 재배치 (config.h)
+- `CFG_SPI_SCLK_PIN`: GPIO45 → **GPIO21** (VDD_SPI strapping 핀 회피)
+- `CFG_SPI_MOSI_PIN`: GPIO20 → **GPIO14** (USB D- 핀 충돌 회피)
+- `CFG_SPI_MISO_PIN`: GPIO19 → **GPIO3** (USB D+ 핀 충돌 회피)
+- USB CDC 디버깅과 SPI 동시 사용 가능
+
+### 문서 정비
+- **README.md** 전면 재작성: 프로젝트 개요, 아키텍처, 핀 맵, 프로토콜, 빌드 환경, 사용법 등 체계적 문서화
+- **CHANGELOG.md** 루트로 이동 (기존 `docs/CHANGELOG.md` → 루트)
+- `docs/README_Arduino_빌드방법.md` 제거 (README.md에 통합)
+- `docs/듀얼칩설계전략및펌웨어업그레이드방법.md` 수정
+
+### 변경 파일
+- `esp32s3/DeepCoS3_Robot/DeepCoS3_Robot.ino` — Joy 프로토콜 (+70줄)
+- `esp32s3/DeepCoS3_Robot/config.h` — SPI 핀 재배치
+- `README.md` — 전면 재작성 (310줄)
+- `CHANGELOG.md` — 루트로 이동 + v0.2.2 추가
+- `docs/README_Arduino_빌드방법.md` — 삭제 (README에 통합)
+
+---
+
 ## [v0.2.1] — 2026-02-12 — 카메라 FPS 안정화 (19 FPS 평균, 0 FPS 제거)
 
 ### 배경

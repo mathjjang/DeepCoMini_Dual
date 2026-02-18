@@ -9,7 +9,7 @@
 // =============================================
 // 펌웨어 버전 (GitHub 태그와 반드시 일치시킬 것)
 // =============================================
-#define CFG_FW_VERSION    "0.2.1"
+#define CFG_FW_VERSION    "0.2.2"
 #define CFG_FW_CHIP       "S3"
 
 // =============================================
@@ -40,9 +40,9 @@
 // =============================================
 // SPI 슬레이브 (카메라 → RTL)
 // =============================================
-#define CFG_SPI_SCLK_PIN    45
-#define CFG_SPI_MOSI_PIN    20      // Master(RTL) → Slave(S3)
-#define CFG_SPI_MISO_PIN    19      // Slave(S3) → Master(RTL)
+#define CFG_SPI_SCLK_PIN    21      // v0.2.1: GPIO45(VDD_SPI strapping)에서 변경
+#define CFG_SPI_MOSI_PIN    14      // Master(RTL) → Slave(S3)  — v0.2.1: GPIO20(USB D-)에서 변경
+#define CFG_SPI_MISO_PIN    3       // Slave(S3) → Master(RTL)  — v0.2.1: GPIO19(USB D+)에서 변경
 #define CFG_SPI_CS_PIN      46      // Slave Select
 #define CFG_SPI_BLOCK_BYTES 2048    // DMA 블록 크기
 #define CFG_SPI_QUEUE_SIZE  2       // SPI 큐 깊이

@@ -5,7 +5,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include "esp_camera.h"
-#include "sensor.h"
+#include "esp_system.h"
 #include "driver/spi_slave.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -102,7 +102,7 @@ static void s3Logf(const char* fmt, ...) {
 }
 
 static void configCamera() {
-  camera_config_t config;
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
@@ -671,7 +671,8 @@ void setup() {
   Serial.begin(CFG_LINK_BAUD);
   Serial1.begin(CFG_LINK_BAUD, SERIAL_8N1, CFG_LINK_RX_PIN, CFG_LINK_TX_PIN);
   delay(200);
-  s3Logf("[S3][BOOT] serial motor test");
+  s3Logf("[S3][BOOT] DeepCoS3_Robot v%s (%s)", CFG_FW_VERSION, CFG_FW_CHIP);
+  s3Logf("[S3][BOOT] Arduino Core %s / ESP-IDF %s", ESP_ARDUINO_VERSION_STR, esp_get_idf_version());
   s3Logf("[S3][UART1] baud=%u RX=%d TX=%d", (unsigned)CFG_LINK_BAUD, CFG_LINK_RX_PIN, CFG_LINK_TX_PIN);
 
   pinMode(enPin, OUTPUT);

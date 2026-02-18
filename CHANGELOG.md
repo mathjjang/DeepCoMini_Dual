@@ -5,6 +5,50 @@
 
 ---
 
+## [v0.3.0] — 2026-02-14 — Arduino Core 3.x (ESP-IDF 5.x) 마이그레이션
+
+### 배경
+- ESP32 Arduino Core 2.x (ESP-IDF 4.4) → **Core 3.x (ESP-IDF 5.x)** 전환
+- DeepcoMini_v2.0에서 선행 검증된 마이그레이션 패턴 적용
+- RTL8720DN은 Ameba SDK 독립 빌드이므로 영향 없음 (프로젝트 버전만 동기화)
+
+### S3: Core 3.x 호환성 수정 (DeepCoS3_Robot.ino)
+- `camera_config_t config` → `camera_config_t config = {}` (제로 초기화)
+  - ESP-IDF 5.x에서 추가된 `sccb_i2c_port` 등 새 필드의 쓰레기 값 방지
+- `#include "sensor.h"` → 제거 (`esp_camera.h`가 Core 3.x에서 내부 포함)
+- `#include "esp_system.h"` 추가 (`esp_get_idf_version()` 사용)
+- 부팅 로그 개선: 펌웨어 버전 + Arduino Core 버전 + ESP-IDF 버전 표시
+  ```
+  [S3][BOOT] DeepCoS3_Robot v0.3.0 (S3)
+  [S3][BOOT] Arduino Core 3.3.7 / ESP-IDF v5.1.4
+  ```
+
+### 프로젝트 전체
+- S3 + RTL 펌웨어 버전 0.2.2 → **0.3.0** 동기화
+
+### Core 2.x → 3.x 주요 차이점 (참고)
+| 항목 | Core 2.x (ESP-IDF 4.4) | Core 3.x (ESP-IDF 5.x) |
+|------|------------------------|------------------------|
+| TCP/IP 스택 | LWIP 직접 접근 허용 | TCPIP Core Lock 필수 |
+| FreeRTOS | `pxCurrentTCB` 접근 가능 | `xTaskGetCurrentTaskHandle()` 사용 |
+| mbedTLS | `_ret` 접미사 함수 | `_ret` 제거됨 |
+| LEDC | 채널 기반 API | 새 타이머-채널 분리 API |
+| 바이너리 크기 | 기준 | 10~30% 증가 |
+| GPIO | `gpio_pad_select_gpio()` | `gpio_reset_pin()` |
+
+### 영향 범위
+- **S3**: `DeepCoS3_Robot.ino`, `config.h` 수정
+- **RTL**: `config.h` 버전만 동기화 (코드 변경 없음)
+- **SPI 프로토콜**: `dcm_spi_protocol.h` 변경 없음 (순수 C 구조체)
+- **파티션**: 변경 없음 (OTA 슬롯 3.87MB 충분)
+
+### 변경 파일
+- `esp32s3/DeepCoS3_Robot/DeepCoS3_Robot.ino` — Core 3.x 호환 수정
+- `esp32s3/DeepCoS3_Robot/config.h` — 버전 0.3.0
+- `rtl8720dn/DeepCoRTL_Bridge/config.h` — 버전 0.3.0 동기화
+
+---
+
 ## [v0.2.2] — 2026-02-14 — Joy 프로토콜 + SPI 핀 재배치 + 문서 정비
 
 ### S3: Joy 프로토콜 추가 (DeepCoS3_Robot.ino)

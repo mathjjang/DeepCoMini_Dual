@@ -254,9 +254,8 @@ static void fillTxBlock(uint8_t* buf) {
   h->payload_len = 0;
   h->crc16 = 0;
 
-  // 1ms 대기 — 비차단(0)에서 변경. loop()의 짧은 프레임 교체를 기다려
-  // 불필요한 IDLE 블록 생성을 줄임 (SPI 큐에 IDLE이 선점되는 문제 완화)
-  if (!g_frameMutex || xSemaphoreTake(g_frameMutex, pdMS_TO_TICKS(1)) != pdTRUE) return;
+  // 비차단 잠금 — spiServiceTask가 블로킹되면 SPI 파이프라인 정체 유발
+  if (!g_frameMutex || xSemaphoreTake(g_frameMutex, 0) != pdTRUE) return;
 
   // 카메라 프레임이 준비되지 않았으면 IDLE 반환
   if (!g_snapReady || !g_fb) {
@@ -753,9 +752,9 @@ void setup() {
   }
 
   g_spiOk = spiSlaveInit();
-  xTaskCreate(spiServiceTask, "spi_service", 6144, NULL, 2, &g_spiTaskHandle);
+  xTaskCreatePinnedToCore(spiServiceTask, "spi_service", 6144, NULL, 2, &g_spiTaskHandle, 1);
   xTaskCreatePinnedToCore(cameraCaptureTask, "cam_cap", 4096, NULL, 1, &g_camTaskHandle, 0);
-  s3Logf("[S3][CAM] tasks started (spi=%d cam=%d camTask=Core0)", g_spiOk ? 1 : 0, g_cameraOk ? 1 : 0);
+  s3Logf("[S3][CAM] tasks: spi_service=Core1, cam_cap=Core0 (spi=%d cam=%d)", g_spiOk ? 1 : 0, g_cameraOk ? 1 : 0);
 }
 
 void loop() {

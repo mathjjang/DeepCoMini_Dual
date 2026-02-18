@@ -64,6 +64,7 @@ static bool g_cameraOk = false;
 static uint32_t g_camFrames = 0;
 static uint32_t g_camFails = 0;
 static TaskHandle_t g_spiTaskHandle = nullptr;
+static TaskHandle_t g_camTaskHandle = nullptr;
 
 // SPI slave (S3 -> RTL camera stream)
 static constexpr int SPI_SCLK_PIN = CFG_SPI_SCLK_PIN;
@@ -253,8 +254,9 @@ static void fillTxBlock(uint8_t* buf) {
   h->payload_len = 0;
   h->crc16 = 0;
 
-  // 비차단 잠금 — loop()가 프레임 교체 중이면 IDLE 반환 (SPI 태스크를 블로킹하지 않음)
-  if (!g_frameMutex || xSemaphoreTake(g_frameMutex, 0) != pdTRUE) return;
+  // 1ms 대기 — 비차단(0)에서 변경. loop()의 짧은 프레임 교체를 기다려
+  // 불필요한 IDLE 블록 생성을 줄임 (SPI 큐에 IDLE이 선점되는 문제 완화)
+  if (!g_frameMutex || xSemaphoreTake(g_frameMutex, pdMS_TO_TICKS(1)) != pdTRUE) return;
 
   // 카메라 프레임이 준비되지 않았으면 IDLE 반환
   if (!g_snapReady || !g_fb) {
@@ -355,6 +357,46 @@ static void spiServiceTask(void* parameter) {
         }
         break;
       }
+    }
+  }
+}
+
+// v0.3.1: 스트리밍 캡처 전용 태스크 (Core 0)
+// loop()(Core 1)에서 분리하여 UART 파싱과 카메라 캡처가 서로 블로킹하지 않도록 함.
+// v2.0의 cameraCaptureTask 패턴 적용.
+static void cameraCaptureTask(void* parameter) {
+  (void)parameter;
+  for (;;) {
+    if (!g_streaming || !g_cameraOk) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    bool needCapture = false;
+    if (g_frameMutex && xSemaphoreTake(g_frameMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      needCapture = !g_snapReady;
+      xSemaphoreGive(g_frameMutex);
+    }
+
+    if (needCapture) {
+      camera_fb_t* fb = esp_camera_fb_get();
+
+      if (fb && fb->buf && fb->len > 0) {
+        if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
+        if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
+        g_fb = fb;
+        g_fbOff = 0;
+        g_frameSeq++;
+        if (g_frameSeq == 0) g_frameSeq = 1;
+        g_camFrames++;
+        g_snapReady = true;
+        if (g_frameMutex) xSemaphoreGive(g_frameMutex);
+      } else {
+        g_camFails++;
+        if (fb) esp_camera_fb_return(fb);
+      }
+    } else {
+      vTaskDelay(1);
     }
   }
 }
@@ -712,7 +754,8 @@ void setup() {
 
   g_spiOk = spiSlaveInit();
   xTaskCreate(spiServiceTask, "spi_service", 6144, NULL, 2, &g_spiTaskHandle);
-  s3Logf("[S3][CAM] spi_service started (spi=%d cam=%d)", g_spiOk ? 1 : 0, g_cameraOk ? 1 : 0);
+  xTaskCreatePinnedToCore(cameraCaptureTask, "cam_cap", 4096, NULL, 1, &g_camTaskHandle, 0);
+  s3Logf("[S3][CAM] tasks started (spi=%d cam=%d camTask=Core0)", g_spiOk ? 1 : 0, g_cameraOk ? 1 : 0);
 }
 
 void loop() {
@@ -723,41 +766,8 @@ void loop() {
   if (readLineFromSerial1(line, sizeof(line)) && line[0] != '\0') {
     handleCommandLine(line);
   }
-
-  // Stream mode: 이전 프레임이 SPI로 전송 완료되면 자동으로 다음 프레임 캡처
-  // v0.2.1: 뮤텍스 보호 — esp_camera_fb_get()은 블로킹이므로 뮤텍스 밖에서 호출
-  if (g_streaming && g_cameraOk) {
-    // (1) 뮤텍스 하에 g_snapReady 확인
-    bool needCapture = false;
-    if (g_frameMutex && xSemaphoreTake(g_frameMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-      needCapture = !g_snapReady;
-      xSemaphoreGive(g_frameMutex);
-    }
-
-    if (needCapture) {
-      // (2) 카메라 캡처 — 뮤텍스 밖 (blocking OK, loop task)
-      camera_fb_t* fb = esp_camera_fb_get();
-
-      if (fb && fb->buf && fb->len > 0) {
-        // (3) 뮤텍스 하에 공유 변수 업데이트
-        if (g_frameMutex) xSemaphoreTake(g_frameMutex, portMAX_DELAY);
-        if (g_fb) { esp_camera_fb_return(g_fb); g_fb = nullptr; }
-        g_fb = fb;
-        g_fbOff = 0;
-        g_frameSeq++;
-        if (g_frameSeq == 0) g_frameSeq = 1;
-        g_camFrames++;
-        g_snapReady = true;
-        if (g_frameMutex) xSemaphoreGive(g_frameMutex);
-      } else {
-        g_camFails++;
-        if (fb) esp_camera_fb_return(fb);
-      }
-    } else {
-      delay(1);  // g_snapReady==true → SPI가 전송 완료할 때까지 yield
-    }
-  } else {
-    delay(1);  // 스트리밍 중 아닐 때만 yield
-  }
+  // v0.3.1: 스트리밍 캡처는 cameraCaptureTask(Core 0)로 이동.
+  // loop()(Core 1)는 UART 파싱 + Snap 명령만 처리.
+  delay(1);
 }
 

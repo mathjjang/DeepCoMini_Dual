@@ -1097,12 +1097,16 @@ static bool pullStreamFrame(uint32_t timeoutMs) {
   uint16_t curSeq = 0;
   uint32_t expectedTotal = 0;
   size_t received = 0;
+  uint8_t idleRetries = 0;
+  static constexpr uint8_t IDLE_BURST_MAX = 4;
 
   while (millis() - start < timeoutMs) {
     spiReadBlock(g_spiRx, SPI_BLOCK_BYTES);
     const DcmSpiHdr* hdr = (const DcmSpiHdr*)g_spiRx;
 
-    if (!hdrLooksOk(*hdr)) {
+    if (!hdrLooksOk(*hdr) || hdr->type == SPI_TYPE_IDLE) {
+      if (++idleRetries < IDLE_BURST_MAX) continue;
+      idleRetries = 0;
 #if RTL_HAS_FREERTOS
       taskYIELD();
 #else
@@ -1110,15 +1114,7 @@ static bool pullStreamFrame(uint32_t timeoutMs) {
 #endif
       continue;
     }
-
-    if (hdr->type == SPI_TYPE_IDLE) {
-#if RTL_HAS_FREERTOS
-      taskYIELD();
-#else
-      yield();
-#endif
-      continue;
-    }
+    idleRetries = 0;
 
     if (hdr->type != SPI_TYPE_JPEG) continue;
 
@@ -1869,7 +1865,7 @@ static void taskSpiPull(void* arg) {
 
     // Stream mode: UART 없이 SPI만으로 프레임 pull
     // S3가 자율적으로 캡처+SPI 큐 → RTL은 SPI 헤더로 프레임 조립
-    if (pullStreamFrame(100)) {   // v0.2.1: 타임아웃 500→100ms
+    if (pullStreamFrame(200)) {   // v0.3.1: 타임아웃 100→200ms (캡처 대기 여유 확보)
       g_frameReady = true;  // taskWsUart에게 전송 요청
       g_snapOkCount++;
     } else {

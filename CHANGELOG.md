@@ -5,6 +5,39 @@
 
 ---
 
+## [v0.3.1] — 2026-02-14 — 카메라 스트리밍 FPS 안정화
+
+### 배경
+- v2.0(단일 칩)은 안정적 ~40fps인 반면, Dual은 0~40fps로 불규칙
+- 원인: SPI 파이프라인의 IDLE 블록 연쇄 지연 + 싱글코어 RTL 스케줄링 병목
+
+### S3: 캡처 태스크 Core 0 분리 (DeepCoS3_Robot.ino)
+- `cameraCaptureTask` 추가 — `xTaskCreatePinnedToCore(Core 0)`
+- `loop()`(Core 1)에서 스트리밍 캡처 로직 제거 → UART 파싱 전용
+- v2.0의 `cameraCaptureTask` 패턴 적용: 캡처와 명령 처리가 완전 병렬
+- `fillTxBlock()` 뮤텍스 타임아웃 0ms → 1ms
+  - 비차단(0)이면 loop()의 짧은 프레임 교체 중에도 IDLE 반환
+  - 1ms 대기로 불필요한 IDLE 블록 생성 감소
+
+### RTL: SPI 풀링 최적화 (DeepCoRTL_Bridge.ino)
+- `pullStreamFrame()` IDLE 수신 시 즉시 yield → **4회 burst retry 후 yield**
+  - IDLE 1회당 2~5ms 손실 제거 → 연속 IDLE 구간에서 ~4배 빠른 재시도
+- `pullStreamFrame()` 타임아웃 100ms → **200ms**
+  - S3 캡처 지연(간헐적 50ms+) 대응 여유 확보, 불필요한 fail 감소
+
+### 예상 효과
+- 0 FPS 구간 제거 또는 대폭 감소
+- 평균 FPS 향상 (15~25fps → 20~30fps 예상)
+- IDLE 연쇄 지연 제거로 프레임 간 간격 안정화
+
+### 변경 파일
+- `esp32s3/DeepCoS3_Robot/DeepCoS3_Robot.ino` — cameraCaptureTask 추가, loop() 간소화, 뮤텍스 개선
+- `esp32s3/DeepCoS3_Robot/config.h` — 버전 0.3.1
+- `rtl8720dn/DeepCoRTL_Bridge/DeepCoRTL_Bridge.ino` — IDLE burst retry, 타임아웃 확대
+- `rtl8720dn/DeepCoRTL_Bridge/config.h` — 버전 0.3.1
+
+---
+
 ## [v0.3.0] — 2026-02-14 — Arduino Core 3.x (ESP-IDF 5.x) 마이그레이션
 
 ### 배경
